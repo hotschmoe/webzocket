@@ -1,10 +1,10 @@
 const std = @import("std");
 
-pub fn build(b: *std.Build) !void {
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const websocket_module = b.addModule("websocket", .{
+    const websocket_module = b.addModule("webzocket", .{
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/websocket.zig"),

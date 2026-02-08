@@ -1,27 +1,150 @@
 name: CI
-on: [push]
+
+on:
+  pull_request:
+    branches: [master]
+
+env:
+  ZIG_VERSION: "0.15.2"
+
 jobs:
-  test:
+  version-check:
+    name: Version Bump Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Install dependencies
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check Version Bump
         run: |
-            sudo snap install zig --classic --edge
-            zig version
-      - name: non-blocking test
-        run: zig build test -Dforce_blocking=false
-      - name: blocking test
-        run: zig build test -Dforce_blocking=true
-      - name: build server x86-linux-gnu
-        run: cd support/autobahn/server && zig build -Dtarget=x86-linux-gnu
-      - name: build server x86_64-linux-gnu
-        run: cd support/autobahn/server && zig build -Dtarget=x86_64-linux-gnu
-      - name: build server x86_64-windows-gnu
-        run: cd support/autobahn/server && zig build -Dtarget=x86_64-windows-gnu
-      - name: build client x86-linux-gnu
-        run: cd support/autobahn/client && zig build -Dtarget=x86-linux-gnu
-      - name: build server x86_64-linux-gnu
-        run: cd support/autobahn/client && zig build -Dtarget=x86_64-linux-gnu
-      - name: build clietn x86_64-windows-gnu
-        run: cd support/autobahn/client && zig build -Dtarget=x86_64-windows-gnu
+          PR_VERSION=$(sed -n 's/.*\.version = "\([^"]*\)".*/\1/p' build.zig.zon)
+          git fetch origin master
+          MASTER_VERSION=$(git show origin/master:build.zig.zon | sed -n 's/.*\.version = "\([^"]*\)".*/\1/p')
+          echo "PR version: $PR_VERSION"
+          echo "Master version: $MASTER_VERSION"
+          if [ "$PR_VERSION" = "$MASTER_VERSION" ]; then
+            echo "::error::Version not bumped! Update .version in build.zig.zon"
+            exit 1
+          fi
+          echo "Version bump verified: $MASTER_VERSION -> $PR_VERSION"
+
+  test:
+    needs: version-check
+    name: Test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+        include:
+          - os: ubuntu-latest
+            optimize: ReleaseFast
+          - os: ubuntu-latest
+            optimize: ReleaseSmall
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=${{ matrix.optimize }}
+
+      - name: Run Tests (non-blocking)
+        run: zig build test -Doptimize=${{ matrix.optimize }}
+
+      - name: Run Tests (blocking)
+        run: zig build test -Doptimize=${{ matrix.optimize }} -Dforce_blocking=true
+
+  format:
+    name: Format Check
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Check Formatting
+        run: zig fmt --check src/
+
+  package:
+    name: Package Validation
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Validate Package
+        run: |
+          mkdir -p test-consumer
+          cd test-consumer
+
+          cat > build.zig.zon << 'EOF'
+          .{
+              .name = .test_consumer,
+              .version = "0.0.0",
+              .fingerprint = 0xe5383c7136a60b55,
+              .dependencies = .{
+                  .webzocket = .{
+                      .path = "..",
+                  },
+              },
+              .paths = .{
+                  "build.zig",
+                  "build.zig.zon",
+                  "src",
+              },
+          }
+          EOF
+
+          cat > build.zig << 'EOF'
+          const std = @import("std");
+          pub fn build(b: *std.Build) void {
+              const target = b.standardTargetOptions(.{});
+              const optimize = b.standardOptimizeOption(.{});
+              const webzocket = b.dependency("webzocket", .{
+                  .target = target,
+                  .optimize = optimize,
+              });
+              const exe = b.addExecutable(.{
+                  .name = "test",
+                  .root_module = b.createModule(.{
+                      .root_source_file = b.path("src/main.zig"),
+                      .target = target,
+                      .optimize = optimize,
+                      .imports = &.{
+                          .{ .name = "webzocket", .module = webzocket.module("webzocket") },
+                      },
+                  }),
+              });
+              b.installArtifact(exe);
+          }
+          EOF
+
+          mkdir -p src
+          cat > src/main.zig << 'EOF'
+          const webzocket = @import("webzocket");
+          pub fn main() !void {
+              _ = webzocket.Client;
+          }
+          EOF
+
+          zig build
