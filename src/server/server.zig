@@ -1877,7 +1877,7 @@ fn posixSleep(sec: u64, ns: u64) void {
 fn ipAddrToSockaddr(addr: Io.net.IpAddress, out: *posix.sockaddr) posix.socklen_t {
     switch (addr) {
         .ip4 => |ip4| {
-            const sin: *posix.sockaddr.in = @alignCast(@ptrCast(out));
+            const sin: *posix.sockaddr.in = @ptrCast(@alignCast(out));
             sin.* = .{
                 .family = posix.AF.INET,
                 .port = std.mem.nativeToBig(u16, ip4.port),
@@ -1887,7 +1887,7 @@ fn ipAddrToSockaddr(addr: Io.net.IpAddress, out: *posix.sockaddr) posix.socklen_
             return @sizeOf(posix.sockaddr.in);
         },
         .ip6 => |ip6| {
-            const sin6: *posix.sockaddr.in6 = @alignCast(@ptrCast(out));
+            const sin6: *posix.sockaddr.in6 = @ptrCast(@alignCast(out));
             sin6.* = .{
                 .family = posix.AF.INET6,
                 .port = std.mem.nativeToBig(u16, ip6.port),
@@ -1902,7 +1902,7 @@ fn ipAddrToSockaddr(addr: Io.net.IpAddress, out: *posix.sockaddr) posix.socklen_
 
 /// Write a unix socket path into a posix.sockaddr, returning the actual length.
 fn unixPathToSockaddr(path: []const u8, out: *posix.sockaddr) posix.socklen_t {
-    const sun: *posix.sockaddr.un = @alignCast(@ptrCast(out));
+    const sun: *posix.sockaddr.un = @ptrCast(@alignCast(out));
     sun.family = posix.AF.UNIX;
     const copy_len = @min(path.len, sun.path.len - 1);
     @memcpy(sun.path[0..copy_len], path[0..copy_len]);
@@ -1915,14 +1915,14 @@ fn unixPathToSockaddr(path: []const u8, out: *posix.sockaddr) posix.socklen_t {
 fn sockaddrToIpAddr(addr: *const posix.sockaddr) Io.net.IpAddress {
     switch (addr.family) {
         posix.AF.INET => {
-            const sin: *const posix.sockaddr.in = @alignCast(@ptrCast(addr));
+            const sin: *const posix.sockaddr.in = @ptrCast(@alignCast(addr));
             return .{ .ip4 = .{
                 .bytes = @bitCast(sin.addr),
                 .port = std.mem.bigToNative(u16, sin.port),
             } };
         },
         posix.AF.INET6 => {
-            const sin6: *const posix.sockaddr.in6 = @alignCast(@ptrCast(addr));
+            const sin6: *const posix.sockaddr.in6 = @ptrCast(@alignCast(addr));
             return .{ .ip6 = .{
                 .bytes = sin6.addr,
                 .port = std.mem.bigToNative(u16, sin6.port),

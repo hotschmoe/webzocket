@@ -73,7 +73,7 @@ pub fn main(init: std.process.Init) !void {
 fn updateReport(allocator: std.mem.Allocator) !void {
     var client = try websocket.Client.init(allocator, module_io, .{
         .port = 9001,
-        .host = "localhost",
+        .host = "127.0.0.1",
     });
 
     defer client.deinit();
@@ -93,7 +93,7 @@ const Handler = struct {
 
         var client = try websocket.Client.init(allocator, module_io, .{
             .port = 9001,
-            .host = "localhost",
+            .host = "127.0.0.1",
             .buffer_provider = buffer_provider,
         });
         errdefer client.deinit();
