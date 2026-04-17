@@ -12,11 +12,28 @@ existed pre-migration too; the 0.15 Autobahn pipeline simply didn't
 exercise them or they surfaced differently. Items 4–5 are scope we
 deliberately deferred during migration.
 
+## Status
+
+- **#1** — *Done*. Handshake tolerates malformed compression offers.
+- **#2** — *Done*. Non-blocking `cleanupConn` / `shutdownCleanup` now call
+  `reader.deinit()` before releasing `reader.static`.
+- **#3** — *Done*. `respondToHandshakeError`'s else branch now surfaces the
+  actual `@errorName` instead of "unknown".
+- **#4** — Open. Compression rewrite against 0.16 `Io.Reader`/`Writer`.
+- **#5** — Open. TLS client port against 0.16 `std.crypto.tls.Client`.
+- **#6** — *Done*. `thread_pool.zig` imported at top-level from `server.zig`;
+  `ThreadPool: small fuzz` / `ThreadPool: large fuzz` now discovered (31+
+  tests reported).
+
+Related: `io_async_redesign_todo.md` — parked exploration of replacing the
+OS-thread + epoll/kqueue hybrid with a pure `std.Io` async design. Revisit
+before / alongside #4 + #5.
+
 Issues are ordered by **cost-to-fix × impact**.
 
 ---
 
-## 1. Handshake parser 400s on unusual compression offers  *(P0, ~30 min)*
+## 1. Handshake parser 400s on unusual compression offers  *(P0, ~30 min)* — DONE
 
 ### Problem
 
@@ -77,7 +94,7 @@ Remove `"13.7.*"` from `support/autobahn/server/config.json`'s
 
 ---
 
-## 2. Memory leaks in `Fragmented.init` under fragment stress  *(P1, ~1–2 hr)*
+## 2. Memory leaks in `Fragmented.init` under fragment stress  *(P1, ~1–2 hr)* — DONE
 
 ### Problem
 
@@ -143,7 +160,7 @@ The leak is almost certainly one of these paths:
 
 ---
 
-## 3. Handshake extension tolerance — broader audit  *(P2, folds into #1)*
+## 3. Handshake extension tolerance — broader audit  *(P2, folds into #1)* — DONE
 
 After #1 lands, do a one-pass audit of every other header in
 `src/server/handshake.zig` that can return an error from a
@@ -275,7 +292,7 @@ where `options` requires caller-provided `entropy: *const [entropy_len]u8`,
 
 ---
 
-## 6. `ThreadPool` fuzz tests not discovered by test runner  *(P3, ~30 min)*
+## 6. `ThreadPool` fuzz tests not discovered by test runner  *(P3, ~30 min)* — DONE
 
 ### Problem
 

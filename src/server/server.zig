@@ -18,6 +18,13 @@ pub const Handshake = @import("handshake.zig").Handshake;
 const Compression = @import("../websocket.zig").Compression;
 const FallbackAllocator = @import("fallback_allocator.zig").FallbackAllocator;
 
+// Ensure thread_pool tests are discovered. thread_pool.zig is otherwise
+// only @import'd inside the NonBlocking generic function body, which Zig
+// analyzes lazily — tests in it would not reach builtin.test_functions.
+comptime {
+    _ = @import("thread_pool.zig");
+}
+
 const DEFAULT_MAX_CONN = 16_384;
 const DEFAULT_BUFFER_SIZE = 2048;
 const DEFAULT_MAX_MESSAGE_SIZE = 65_536;
@@ -847,6 +854,13 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
                 hc.cleanup.lockUncancelable(hc.conn.io);
                 defer hc.cleanup.unlock(hc.conn.io);
                 if (hc.reader) |*reader| {
+                    // Must deinit before releasing reader.static: deinit frees
+                    // fragment, decompress_writer, and any pinned large buffer.
+                    // Reader.deinit deliberately does not touch reader.static.
+                    // If we skipped this and let conn_manager.cleanup handle it,
+                    // we'd miss it — we null hc.reader below, which makes the
+                    // deinit branch in conn_manager.cleanup a no-op.
+                    reader.deinit();
                     if (self.small_buffer_pool) |*sbp| {
                         sbp.release(reader.static);
                     } else {
@@ -868,6 +882,11 @@ fn NonBlockingBase(comptime H: type, comptime MANAGE_HS: bool) type {
             hc.cleanup.lockUncancelable(hc.conn.io);
             defer hc.cleanup.unlock(hc.conn.io);
             if (hc.reader) |*reader| {
+                // See cleanupConn above: deinit first to release fragment /
+                // decompress_writer / large buffer. reader.static is released
+                // separately (pool release vs. allocator.free), or left to the
+                // pool lifetime when a small_buffer_pool is in use.
+                reader.deinit();
                 if (self.small_buffer_pool == null) {
                     self.allocator.free(reader.static);
                 }
@@ -1806,8 +1825,12 @@ fn needsAllocator(comptime H: type) bool {
 }
 
 fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
-    const response = switch (err) {
-        error.Close => return,
+    if (err == error.Close) return;
+    // Stack buffer for the else branch. Lifetime is fine because
+    // preHandOffWrite writes to the socket synchronously before returning.
+    var stack_buf: [256]u8 = undefined;
+    const response: []const u8 = switch (err) {
+        error.Close => unreachable,
         error.RequestTooLarge => buildError(400, "too large"),
         error.Timeout, error.WouldBlock => buildError(400, "timeout"),
         error.InvalidProtocol => buildError(400, "invalid protocol"),
@@ -1818,7 +1841,11 @@ fn respondToHandshakeError(conn: *Conn, err: anyerror) void {
         error.InvalidConnection => buildError(400, "invalid connection"),
         error.MissingHeaders => buildError(400, "missingheaders"),
         error.Empty => buildError(400, "invalid request"),
-        else => buildError(400, "unknown"),
+        else => std.fmt.bufPrint(
+            &stack_buf,
+            "HTTP/1.1 400 \r\nConnection: Close\r\nError: {s}\r\nContent-Length: 0\r\n\r\n",
+            .{@errorName(err)},
+        ) catch buildError(400, "unknown"),
     };
     preHandOffWrite(conn, response);
 }
