@@ -124,6 +124,9 @@ pub const Reader = struct {
         }
     }
 
+    // Legacy fill — used by server.zig / client.zig while they still run on
+    // the pre-Io path. Deleted as part of the server rewrite (task #3).
+    // New code should use `fillIo` against a `*std.Io.Reader`.
     pub fn fill(self: *Reader, stream: anytype) !void {
         const pos = self.pos;
         std.debug.assert(self.buf.data.len > pos);
@@ -131,6 +134,23 @@ pub const Reader = struct {
         if (n == 0) {
             return error.Closed;
         }
+        self.pos = pos + n;
+    }
+
+    // Io-native fill. Reads from `io_reader` into the static/large buffer
+    // owned by this Reader. `readSliceShort` drains the Io.Reader's internal
+    // buffer first, then calls its underlying `readVec` to pull more bytes.
+    // A short read (n == 0) means the peer closed the stream.
+    pub fn fillIo(self: *Reader, io_reader: *std.Io.Reader) !void {
+        const pos = self.pos;
+        std.debug.assert(self.buf.data.len > pos);
+        const n = io_reader.readSliceShort(self.buf.data[pos..]) catch |err| switch (err) {
+            // Detailed diagnostic is stashed on the stream's Reader wrapper
+            // (e.g. net.Stream.Reader.err). Callers of fillIo translate this
+            // to a connection-level close, same as the legacy path did.
+            error.ReadFailed => return error.Closed,
+        };
+        if (n == 0) return error.Closed;
         self.pos = pos + n;
     }
 
@@ -588,29 +608,29 @@ test "mask" {
 test "Reader: read too large" {
     defer t.reset();
 
-    var pair = t.SocketPair.init(.{});
-    defer pair.deinit();
-    pair.textFrame(true, "hello world");
-    pair.sendBuf();
+    var writer = t.Writer.init();
+    defer writer.deinit();
+    writer.textFrame(true, "hello world");
 
+    var io_reader = std.Io.Reader.fixed(writer.bytes());
     var reader = testReader(.{ .max = 16, .static = 16 });
     defer reader.deinit();
-    try t.expectError(error.TooLarge, testRead(&reader, pair));
+    try t.expectError(error.TooLarge, testReadIo(&reader, &io_reader));
 }
 
 test "Reader: read too large over multiple fragments" {
     defer t.reset();
 
-    var pair = t.SocketPair.init(.{});
-    defer pair.deinit();
-    pair.textFrame(false, "hello world");
-    pair.cont(false, " !!!_!!! ");
-    pair.cont(true, "how are you doing?");
-    pair.sendBuf();
+    var writer = t.Writer.init();
+    defer writer.deinit();
+    writer.textFrame(false, "hello world");
+    writer.cont(false, " !!!_!!! ");
+    writer.cont(true, "how are you doing?");
 
+    var io_reader = std.Io.Reader.fixed(writer.bytes());
     var reader = testReader(.{ .max = 32, .static = 32 });
     defer reader.deinit();
-    try t.expectError(error.TooLarge, testRead(&reader, pair));
+    try t.expectError(error.TooLarge, testReadIo(&reader, &io_reader));
 }
 
 // Regression guard for the non-blocking cleanup path: if a connection is torn
@@ -620,15 +640,15 @@ test "Reader: read too large over multiple fragments" {
 test "Reader: deinit during in-flight fragment does not leak" {
     defer t.reset();
 
-    var pair = t.SocketPair.init(.{});
-    defer pair.deinit();
-    pair.textFrame(false, "hello ");
-    pair.sendBuf();
+    var writer = t.Writer.init();
+    defer writer.deinit();
+    writer.textFrame(false, "hello ");
 
+    var io_reader = std.Io.Reader.fixed(writer.bytes());
     var reader = testReader(.{ .max = 128, .static = 64 });
     // NOTE: no `defer reader.deinit()` in the loop — we call it explicitly
     // after the partial read so a leak in the fragment path would surface.
-    try reader.fill(pair.server);
+    try reader.fillIo(&io_reader);
     // Non-FIN text frame stashes a Fragmented and returns null (more data needed).
     try t.expectEqual(null, try reader.read());
     try std.testing.expect(reader.fragment != null);
@@ -641,14 +661,14 @@ test "Reader: deinit during in-flight fragment does not leak" {
 test "Reader: exact read into static with no overflow" {
     defer t.reset();
 
-    var pair = t.SocketPair.init(.{});
-    defer pair.deinit();
-    pair.textFrame(true, "hello!");
-    pair.sendBuf();
+    var writer = t.Writer.init();
+    defer writer.deinit();
+    writer.textFrame(true, "hello!");
 
+    var io_reader = std.Io.Reader.fixed(writer.bytes());
     var reader = testReader(.{ .max = 12, .static = 12 });
     defer reader.deinit();
-    try t.expectString("hello!", (try testRead(&reader, pair)).data);
+    try t.expectString("hello!", (try testReadIo(&reader, &io_reader)).data);
 }
 
 test "Reader: fuzz" {
@@ -748,9 +768,15 @@ test "Reader: fuzz" {
         defer reader.large_buffer_provider.deinit();
         defer reader.deinit();
 
+        // Feed the Reader via an Io.Reader.fixed over all accumulated frames.
+        // The fuzz coverage comes from randomized message counts / fragment
+        // counts / static buffer sizes / large-buffer pool variants above —
+        // the input source doesn't need to add its own randomization layer.
+        var io_reader = std.Io.Reader.fixed(writer.bytes());
+
         i = 0;
         while (true) {
-            reader.fill(&writer) catch |err| switch (err) {
+            reader.fillIo(&io_reader) catch |err| switch (err) {
                 error.Closed => {
                     try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
                     break;
@@ -847,10 +873,10 @@ fn testReader(opts: anytype) Reader {
     return Reader.init(reader_buf, bp, null);
 }
 
-fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
+fn testReadIo(reader: *Reader, io_r: *std.Io.Reader) !Message {
     var i: usize = 0;
     while (i < 100) : (i += 1) {
-        try reader.fill(pair.server);
+        try reader.fillIo(io_r);
         if (try reader.read()) |result| {
             return result.@"1";
         }
