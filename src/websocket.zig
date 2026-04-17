@@ -28,8 +28,8 @@ pub const Compression = struct {
     // server_no_context_takeover: bool = false,
 };
 
-pub fn bufferProvider(allocator: std.mem.Allocator, config: buffer.Config) !buffer.Provider {
-    return buffer.Provider.init(allocator, config);
+pub fn bufferProvider(allocator: std.mem.Allocator, io: std.Io, config: buffer.Config) !buffer.Provider {
+    return buffer.Provider.init(allocator, io, config);
 }
 
 pub fn frameText(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {

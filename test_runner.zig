@@ -18,16 +18,34 @@ const BORDER = "=" ** 80;
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
 
-pub fn main() !void {
-    var mem: [8192]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&mem);
+/// Io instance exposed for use by test code.
+/// NOTE: test_runner.zig cannot directly set src/t.zig's test_io because
+/// @import("src/t.zig") creates a duplicate module-path collision (websocket.zig
+/// already imports t.zig as "t.zig" within the src/ root). A build.zig change
+/// to expose "t" as a named module is needed to wire this properly (Phase 5).
+/// For now, we initialize std.testing.io_instance so that std.testing.io works,
+/// and t.zig's getRandom() uses std.testing.io.
+pub var test_io: std.Io = undefined;
 
-    const allocator = fba.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+    const environ = init.environ_map;
 
-    const env = Env.init(allocator);
-    defer env.deinit(allocator);
+    _ = gpa; // available for future use
 
-    var slowest = SlowTracker.init(allocator, 5);
+    // Initialize std.testing.io_instance so that std.testing.io is valid.
+    // Tests and helpers that need Io (e.g. t.zig's getRandom) use std.testing.io.
+    // Note: global_single_threaded does not support concurrency or cancellation,
+    // but that is fine for the test suite.
+    std.testing.io_instance = std.Io.Threaded.global_single_threaded.*;
+
+    // Also expose the real Io from process.Init for callers who want it.
+    test_io = io;
+
+    const env = Env.init(environ);
+
+    var slowest = SlowTracker.init(std.testing.allocator, io, 5);
     defer slowest.deinit();
 
     var pass: usize = 0;
@@ -37,32 +55,32 @@ pub fn main() !void {
 
     Printer.fmt("\r\x1b[0K", .{}); // beginning of line and clear to end of line
 
-    for (builtin.test_functions) |t| {
-        if (isSetup(t)) {
-            t.func() catch |err| {
-                Printer.status(.fail, "\nsetup \"{s}\" failed: {}\n", .{ t.name, err });
+    for (builtin.test_functions) |tf| {
+        if (isSetup(tf)) {
+            tf.func() catch |err| {
+                Printer.status(.fail, "\nsetup \"{s}\" failed: {}\n", .{ tf.name, err });
                 return err;
             };
         }
     }
 
-    for (builtin.test_functions) |t| {
-        if (isSetup(t) or isTeardown(t)) {
+    for (builtin.test_functions) |tf| {
+        if (isSetup(tf) or isTeardown(tf)) {
             continue;
         }
 
         var status = Status.pass;
         slowest.startTiming();
 
-        const is_unnamed_test = isUnnamed(t);
+        const is_unnamed_test = isUnnamed(tf);
         if (env.filter) |f| {
-            if (!is_unnamed_test and std.mem.indexOf(u8, t.name, f) == null) {
+            if (!is_unnamed_test and std.mem.indexOf(u8, tf.name, f) == null) {
                 continue;
             }
         }
 
         const friendly_name = blk: {
-            const name = t.name;
+            const name = tf.name;
             var it = std.mem.splitScalar(u8, name, '.');
             while (it.next()) |value| {
                 if (std.mem.eql(u8, value, "test")) {
@@ -75,7 +93,7 @@ pub fn main() !void {
 
         current_test = friendly_name;
         std.testing.allocator_instance = .{};
-        const result = t.func();
+        const result = tf.func();
         current_test = null;
 
         const ns_taken = slowest.endTiming(friendly_name);
@@ -97,7 +115,7 @@ pub fn main() !void {
                 fail += 1;
                 Printer.status(.fail, "\n{s}\n\"{s}\" - {s}\n{s}\n", .{ BORDER, friendly_name, @errorName(err), BORDER });
                 if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace.*);
+                    std.debug.dumpErrorReturnTrace(trace);
                 }
                 if (env.fail_first) {
                     break;
@@ -113,10 +131,10 @@ pub fn main() !void {
         }
     }
 
-    for (builtin.test_functions) |t| {
-        if (isTeardown(t)) {
-            t.func() catch |err| {
-                Printer.status(.fail, "\nteardown \"{s}\" failed: {}\n", .{ t.name, err });
+    for (builtin.test_functions) |tf| {
+        if (isTeardown(tf)) {
+            tf.func() catch |err| {
+                Printer.status(.fail, "\nteardown \"{s}\" failed: {}\n", .{ tf.name, err });
                 return err;
             };
         }
@@ -134,7 +152,7 @@ pub fn main() !void {
     Printer.fmt("\n", .{});
     try slowest.display();
     Printer.fmt("\n", .{});
-    std.posix.exit(if (fail == 0) 0 else 1);
+    std.process.exit(if (fail == 0) 0 else 1);
 }
 
 const Printer = struct {
@@ -162,17 +180,20 @@ const Status = enum {
 
 const SlowTracker = struct {
     const SlowestQueue = std.PriorityDequeue(TestInfo, void, compareTiming);
+    allocator: Allocator,
     max: usize,
     slowest: SlowestQueue,
-    timer: std.time.Timer,
+    io: std.Io,
+    start: std.Io.Timestamp,
 
-    fn init(allocator: Allocator, count: u32) SlowTracker {
-        const timer = std.time.Timer.start() catch @panic("failed to start timer");
-        var slowest = SlowestQueue.init(allocator, {});
-        slowest.ensureTotalCapacity(count) catch @panic("OOM");
+    fn init(allocator: Allocator, io: std.Io, count: u32) SlowTracker {
+        var slowest = SlowestQueue.initContext({});
+        slowest.ensureTotalCapacity(allocator, count) catch @panic("OOM");
         return .{
+            .allocator = allocator,
             .max = count,
-            .timer = timer,
+            .io = io,
+            .start = std.Io.Timestamp.now(io, .awake),
             .slowest = slowest,
         };
     }
@@ -182,24 +203,25 @@ const SlowTracker = struct {
         name: []const u8,
     };
 
-    fn deinit(self: SlowTracker) void {
-        self.slowest.deinit();
+    fn deinit(self: *SlowTracker) void {
+        self.slowest.deinit(self.allocator);
     }
 
     fn startTiming(self: *SlowTracker) void {
-        self.timer.reset();
+        self.start = std.Io.Timestamp.now(self.io, .awake);
     }
 
     fn endTiming(self: *SlowTracker, test_name: []const u8) u64 {
-        var timer = self.timer;
-        const ns = timer.lap();
+        const end = std.Io.Timestamp.now(self.io, .awake);
+        const duration = self.start.durationTo(end);
+        const ns: u64 = @intCast(@max(0, duration.nanoseconds));
 
         var slowest = &self.slowest;
 
         if (slowest.count() < self.max) {
             // Capacity is fixed to the # of slow tests we want to track
             // If we've tracked fewer tests than this capacity, than always add
-            slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+            slowest.push(self.allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
             return ns;
         }
 
@@ -214,8 +236,8 @@ const SlowTracker = struct {
         }
 
         // the previous fastest of our slow tests, has been pushed off.
-        _ = slowest.removeMin();
-        slowest.add(TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
+        _ = slowest.popMin();
+        slowest.push(self.allocator, TestInfo{ .ns = ns, .name = test_name }) catch @panic("failed to track test timing");
         return ns;
     }
 
@@ -223,7 +245,7 @@ const SlowTracker = struct {
         var slowest = self.slowest;
         const count = slowest.count();
         Printer.fmt("Slowest {d} test{s}: \n", .{ count, if (count != 1) "s" else "" });
-        while (slowest.removeMinOrNull()) |info| {
+        while (slowest.popMin()) |info| {
             const ms = @as(f64, @floatFromInt(info.ns)) / 1_000_000.0;
             Printer.fmt("  {d:.2}ms\t{s}\n", .{ ms, info.name });
         }
@@ -240,34 +262,20 @@ const Env = struct {
     fail_first: bool,
     filter: ?[]const u8,
 
-    fn init(allocator: Allocator) Env {
+    fn init(environ: *std.process.Environ.Map) Env {
         return .{
-            .verbose = readEnvBool(allocator, "TEST_VERBOSE", true),
-            .fail_first = readEnvBool(allocator, "TEST_FAIL_FIRST", false),
-            .filter = readEnv(allocator, "TEST_FILTER"),
+            .verbose = readEnvBool(environ, "TEST_VERBOSE", true),
+            .fail_first = readEnvBool(environ, "TEST_FAIL_FIRST", false),
+            .filter = readEnv(environ, "TEST_FILTER"),
         };
     }
 
-    fn deinit(self: Env, allocator: Allocator) void {
-        if (self.filter) |f| {
-            allocator.free(f);
-        }
+    fn readEnv(environ: *std.process.Environ.Map, key: []const u8) ?[]const u8 {
+        return environ.get(key);
     }
 
-    fn readEnv(allocator: Allocator, key: []const u8) ?[]const u8 {
-        const v = std.process.getEnvVarOwned(allocator, key) catch |err| {
-            if (err == error.EnvironmentVariableNotFound) {
-                return null;
-            }
-            std.log.warn("failed to get env var {s} due to err {}", .{ key, err });
-            return null;
-        };
-        return v;
-    }
-
-    fn readEnvBool(allocator: Allocator, key: []const u8, deflt: bool) bool {
-        const value = readEnv(allocator, key) orelse return deflt;
-        defer allocator.free(value);
+    fn readEnvBool(environ: *std.process.Environ.Map, key: []const u8, deflt: bool) bool {
+        const value = readEnv(environ, key) orelse return deflt;
         return std.ascii.eqlIgnoreCase(value, "true");
     }
 };
@@ -281,18 +289,18 @@ pub const panic = std.debug.FullPanic(struct {
     }
 }.panicFn);
 
-fn isUnnamed(t: std.builtin.TestFn) bool {
+fn isUnnamed(tf: std.builtin.TestFn) bool {
     const marker = ".test_";
-    const test_name = t.name;
+    const test_name = tf.name;
     const index = std.mem.indexOf(u8, test_name, marker) orelse return false;
     _ = std.fmt.parseInt(u32, test_name[index + marker.len ..], 10) catch return false;
     return true;
 }
 
-fn isSetup(t: std.builtin.TestFn) bool {
-    return std.mem.endsWith(u8, t.name, "tests:beforeAll");
+fn isSetup(tf: std.builtin.TestFn) bool {
+    return std.mem.endsWith(u8, tf.name, "tests:beforeAll");
 }
 
-fn isTeardown(t: std.builtin.TestFn) bool {
-    return std.mem.endsWith(u8, t.name, "tests:afterAll");
+fn isTeardown(tf: std.builtin.TestFn) bool {
+    return std.mem.endsWith(u8, tf.name, "tests:afterAll");
 }

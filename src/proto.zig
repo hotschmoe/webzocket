@@ -730,7 +730,6 @@ test "Reader: fuzz" {
                     try t.expectEqual(@as(u32, @intCast(i)), MESSAGE_TO_SEND);
                     break;
                 },
-                else => return err,
             };
 
             while (true) {
@@ -750,7 +749,7 @@ test "Reader: fuzz" {
 
 test "Fragmented" {
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 500 });
+        var bp = try buffer.Provider.init(t.allocator, std.testing.io, .{ .count = 0, .size = 0, .max = 500 });
         var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
 
@@ -764,7 +763,7 @@ test "Fragmented" {
     }
 
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 10 });
+        var bp = try buffer.Provider.init(t.allocator, std.testing.io, .{ .count = 0, .size = 0, .max = 10 });
         var f = try Fragmented.init(&bp, false, .text, "hello");
         defer f.deinit();
         try f.add(" ");
@@ -772,7 +771,7 @@ test "Fragmented" {
     }
 
     {
-        var bp = try buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 5000 });
+        var bp = try buffer.Provider.init(t.allocator, std.testing.io, .{ .count = 0, .size = 0, .max = 5000 });
 
         var r = std.Random.DefaultPrng.init(0);
         var random = r.random();
@@ -812,7 +811,7 @@ fn testReader(opts: anytype) Reader {
     const aa = t.arena.allocator();
 
     const bp = aa.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.allocator, .{
+    bp.* = buffer.Provider.init(t.allocator, std.testing.io, .{
         .max = if (@hasField(T, "max")) opts.max else 20,
         .size = if (@hasField(T, "size")) opts.size else 0,
         .count = if (@hasField(T, "count")) opts.count else 0,
