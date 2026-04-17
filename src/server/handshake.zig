@@ -356,7 +356,8 @@ pub const Handshake = struct {
 };
 
 pub const Pool = struct {
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex = .init,
+    io: std.Io,
     available: usize,
     allocator: Allocator,
     buffer_size: usize,
@@ -364,7 +365,7 @@ pub const Pool = struct {
     max_res_headers: usize,
     states: []*Handshake.State,
 
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize, max_req_headers: usize, max_res_headers: usize) !*Pool {
+    pub fn init(allocator: Allocator, io: std.Io, count: usize, buffer_size: usize, max_req_headers: usize, max_res_headers: usize) !*Pool {
         const states = try allocator.alloc(*Handshake.State, count);
         errdefer allocator.free(states);
 
@@ -372,7 +373,8 @@ pub const Pool = struct {
         errdefer allocator.destroy(pool);
 
         pool.* = .{
-            .mutex = .{},
+            .mutex = .init,
+            .io = io,
             .states = states,
             .allocator = allocator,
             .available = count,
@@ -403,13 +405,14 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool) !*Handshake.State {
+        const io = self.io;
         const states = self.states;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == 0) {
             // dont hold the lock over factory
-            self.mutex.unlock();
+            self.mutex.unlock(io);
 
             const allocator = self.allocator;
             const state = try allocator.create(Handshake.State);
@@ -420,24 +423,25 @@ pub const Pool = struct {
         const index = available - 1;
         const state = states[index];
         self.available = index;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
         return state;
     }
 
     fn release(self: *Pool, state: *Handshake.State) void {
+        const io = self.io;
         var states = self.states;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == states.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
             state.deinit();
             self.allocator.destroy(state);
             return;
         }
         states[available] = state;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
     }
 };
 
@@ -450,7 +454,7 @@ fn toLower(str: []u8) []u8 {
 
 const t = @import("../t.zig");
 test "handshake: parse" {
-    var pool = try Pool.init(t.allocator, 1, 512, 10, 1);
+    var pool = try Pool.init(t.allocator, t.getIo(), 1, 512, 10, 1);
     defer pool.deinit();
 
     {
@@ -604,7 +608,7 @@ test "KeyValue: ignores beyond max" {
 
 test "pool: acquire and release" {
     // not 100% sure this is testing exactly what I want, but it's ....something ?
-    var p = try Pool.init(t.allocator, 2, 10, 3, 1);
+    var p = try Pool.init(t.allocator, t.getIo(), 2, 10, 3, 1);
     defer p.deinit();
 
     var hs1a = p.acquire() catch unreachable;
@@ -634,7 +638,7 @@ test "pool: acquire and release" {
 }
 
 test "Handshake.Pool: threadsafety" {
-    var p = try Pool.init(t.allocator, 4, 10, 2, 2);
+    var p = try Pool.init(t.allocator, t.getIo(), 4, 10, 2, 2);
     defer p.deinit();
 
     for (p.states) |hs| {
@@ -660,7 +664,13 @@ fn testPool(p: *Pool) void {
         var hs = p.acquire() catch unreachable;
         std.debug.assert(hs.buf[0] == 0);
         hs.buf[0] = 255;
-        std.Thread.sleep(random.uintAtMost(u32, 100000));
+        // Spin for a random number of iterations to introduce contention
+        // (std.Thread.sleep was removed in 0.16; io.sleep requires Cancelable).
+        var spin: u32 = 0;
+        const limit = random.uintAtMost(u32, 100);
+        while (spin < limit) : (spin += 1) {
+            std.atomic.spinLoopHint();
+        }
         hs.buf[0] = 0;
         p.release(hs);
     }

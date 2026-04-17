@@ -10,6 +10,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/websocket.zig"),
         .link_libc = true,
     });
+    if (target.result.os.tag == .windows) {
+        websocket_module.linkSystemLibrary("ws2_32", .{});
+    }
 
     {
         const options = b.addOptions();

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
+const Io = std.Io;
 
 pub const Buffer = struct {
     data: []u8,
@@ -104,13 +105,14 @@ pub const Config = struct {
 pub const Provider = struct {
     pool: Pool,
     allocator: Allocator,
+    io: Io,
 
     max_buffer_size: usize,
 
     // If this is 0, pool is undefined. We need this field here anyways.
     pool_buffer_size: usize,
 
-    pub fn init(allocator: Allocator, config: Config) !Provider {
+    pub fn init(allocator: Allocator, io: Io, config: Config) !Provider {
         const size = config.size;
         const count = config.count;
 
@@ -125,15 +127,17 @@ pub const Provider = struct {
                 .pool = undefined,
                 .pool_buffer_size = 0,
                 .allocator = allocator,
+                .io = io,
                 .max_buffer_size = config.max,
             };
         }
 
         return .{
             .allocator = allocator,
+            .io = io,
             .pool_buffer_size = size,
             .max_buffer_size = config.max,
-            .pool = try Pool.init(allocator, count, size),
+            .pool = try Pool.init(allocator, io, count, size),
         };
     }
 
@@ -215,9 +219,10 @@ pub const Pool = struct {
     available: usize,
     buffers: [][]u8,
     allocator: Allocator,
-    mutex: std.Thread.Mutex,
+    io: Io,
+    mutex: Io.Mutex,
 
-    pub fn init(allocator: Allocator, count: usize, buffer_size: usize) !Pool {
+    pub fn init(allocator: Allocator, io: Io, count: usize, buffer_size: usize) !Pool {
         const buffers = try allocator.alloc([]u8, count);
 
         for (0..count) |i| {
@@ -225,10 +230,11 @@ pub const Pool = struct {
         }
 
         return .{
-            .mutex = .{},
+            .mutex = .init,
             .buffers = buffers,
             .available = count,
             .allocator = allocator,
+            .io = io,
             .buffer_size = buffer_size,
         };
     }
@@ -242,10 +248,11 @@ pub const Pool = struct {
     }
 
     pub fn acquire(self: *Pool) ?[]u8 {
+        const io = self.io;
         const buffers = self.buffers;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         const available = self.available;
         if (available == 0) {
             return null;
@@ -261,24 +268,25 @@ pub const Pool = struct {
     }
 
     pub fn release(self: *Pool, buffer: []u8) void {
+        const io = self.io;
         var buffers = self.buffers;
 
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         const available = self.available;
         if (available == buffers.len) {
-            self.mutex.unlock();
+            self.mutex.unlock(io);
             self.allocator.free(buffer);
             return;
         }
         buffers[available] = buffer;
         self.available = available + 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
     }
 };
 
 const t = @import("t.zig");
 test "buffer: no pool" {
-    var p = try Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 100 });
+    var p = try Provider.init(t.allocator, std.testing.io, .{ .count = 0, .size = 0, .max = 100 });
 
     const buffer = try p.alloc(100);
     defer p.free(buffer);
@@ -287,7 +295,7 @@ test "buffer: no pool" {
 }
 
 test "buffer: pool" {
-    var p = try Provider.init(t.allocator, .{ .count = 2, .size = 10, .max = 15 });
+    var p = try Provider.init(t.allocator, std.testing.io, .{ .count = 2, .size = 10, .max = 15 });
     defer p.deinit();
 
     {
@@ -332,7 +340,7 @@ test "buffer: pool" {
 }
 
 test "buffer: grow" {
-    var p = try Provider.init(t.allocator, .{ .count = 1, .size = 10, .max = 30 });
+    var p = try Provider.init(t.allocator, std.testing.io, .{ .count = 1, .size = 10, .max = 30 });
     defer p.deinit();
 
     {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const proto = @import("proto.zig");
 
 const posix = std.posix;
@@ -7,6 +8,20 @@ const ArrayList = std.ArrayList;
 const Message = proto.Message;
 
 pub const allocator = std.testing.allocator;
+
+/// Io handle for use by tests. Returns std.testing.io which is initialized by
+/// test_runner.main via std.testing.io_instance = std.Io.Threaded.global_single_threaded.*.
+/// Using a property accessor avoids the cross-module initialization problem:
+/// test_runner.zig cannot import src/t.zig directly (module path collision),
+/// but std.testing.io is a global that's always valid after test_runner.main runs.
+pub var test_io: std.Io = undefined;
+
+/// Returns a valid Io for test code. Prefers the explicitly-set test_io (if
+/// initialized by a beforeAll hook), falling back to std.testing.io.
+pub fn getIo() std.Io {
+    // std.testing.io_instance is set by test_runner.main before any test runs.
+    return std.testing.io;
+}
 
 pub fn expectEqual(expected: anytype, actual: anytype) !void {
     try std.testing.expectEqual(@as(@TypeOf(actual), expected), actual);
@@ -18,7 +33,11 @@ pub const expectSlice = std.testing.expectEqualSlices;
 
 pub fn getRandom() std.Random.DefaultPrng {
     var seed: u64 = undefined;
-    std.posix.getrandom(std.mem.asBytes(&seed)) catch unreachable;
+    // Use std.testing.io which is initialized by test_runner.main via
+    // std.testing.io_instance. This avoids the cross-module assignment
+    // problem (test_runner.zig cannot import src/t.zig directly because
+    // websocket.zig already imports t.zig under a different canonical path).
+    std.testing.io.random(std.mem.asBytes(&seed));
     return std.Random.DefaultPrng.init(seed);
 }
 
@@ -143,42 +162,74 @@ pub const Writer = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Minimal syscall shims for socket operations removed from std.posix in 0.16.
+//
+// On Linux (with or without libc), posix.system exposes socket(), bind(),
+// listen(), accept(), connect(), close(), write(), fcntl(), getsockname().
+// These return c_int (negative on error) on libc builds or raw syscall
+// return codes on bare-Linux builds.
+//
+// These shims are scoped to the test SocketPair ONLY. A shared posix_compat.zig
+// module is needed before server.zig / client.zig can be migrated (Phase 4).
+//
+// SocketPair is gated to non-Windows because:
+//   • Windows sockets use SOCKET (usize/HANDLE), not the POSIX fd_t (i32).
+//   • The library itself targets Linux (epoll); Windows tests do not exercise
+//     the server/conn path.
+// ---------------------------------------------------------------------------
+
+const compat = @import("posix_compat.zig");
+pub const Stream = compat.Stream;
+
+// ---------------------------------------------------------------------------
+
 pub const SocketPair = struct {
     writer: Writer,
-    client: std.net.Stream,
-    server: std.net.Stream,
+    client: Stream,
+    server: Stream,
 
     const Opts = struct {
         port: ?u16 = null,
     };
 
-    pub fn init(opts: Opts) SocketPair {
-        var address = std.net.Address.parseIp("127.0.0.1", opts.port orelse 0) catch unreachable;
-        var address_len = address.getOsSockLen();
+    pub fn init(opts: Opts) @This() {
+        const ip4 = std.Io.net.Ip4Address.parse("127.0.0.1", opts.port orelse 0) catch unreachable;
+        var addr_in = posix.sockaddr.in{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, ip4.port),
+            .addr = @bitCast(ip4.bytes),
+            .zero = @splat(0),
+        };
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-        const listener = posix.socket(address.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
-        defer posix.close(listener);
+        const cloexec: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
+        const listener = compat.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP) catch unreachable;
+        defer compat.close(listener);
 
-        {
-            // setup our listener
-            posix.bind(listener, &address.any, address_len) catch unreachable;
-            posix.listen(listener, 1) catch unreachable;
-            posix.getsockname(listener, &address.any, &address_len) catch unreachable;
-        }
+        compat.bind(listener, @ptrCast(&addr_in), addr_len) catch unreachable;
+        compat.listen(listener, 1) catch unreachable;
+        compat.getsockname(listener, @ptrCast(&addr_in), &addr_len) catch unreachable;
 
-        const client = posix.socket(address.any.family, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
-        {
-            // connect the client
-            const flags = posix.fcntl(client, posix.F.GETFL, 0) catch unreachable;
-            _ = posix.fcntl(client, posix.F.SETFL, flags | posix.SOCK.NONBLOCK) catch unreachable;
-            posix.connect(client, &address.any, address_len) catch |err| switch (err) {
+        const client = compat.socket(posix.AF.INET, posix.SOCK.STREAM, posix.IPPROTO.TCP) catch unreachable;
+        // Non-blocking connect, then restore blocking flags so the caller sees a synchronous connection.
+        // fcntl is not available on Windows; on Windows we just do a plain blocking connect.
+        if (comptime builtin.os.tag != .windows) {
+            const nonblock: u32 = if (@hasDecl(posix.SOCK, "NONBLOCK")) posix.SOCK.NONBLOCK else 0;
+            const getfl = @field(posix.F, "GETFL");
+            const setfl = @field(posix.F, "SETFL");
+            const flags = compat.fcntl(client, getfl, 0) catch unreachable;
+            _ = compat.fcntl(client, setfl, flags | nonblock) catch unreachable;
+            compat.connect(client, @ptrCast(&addr_in), addr_len) catch |err| switch (err) {
                 error.WouldBlock => {},
                 else => unreachable,
             };
-            _ = posix.fcntl(client, posix.F.SETFL, flags) catch unreachable;
+            _ = compat.fcntl(client, setfl, flags) catch unreachable;
+        } else {
+            compat.connect(client, @ptrCast(&addr_in), addr_len) catch unreachable;
         }
 
-        const server = posix.accept(listener, &address.any, &address_len, posix.SOCK.CLOEXEC) catch unreachable;
+        const server = compat.accept(listener, @ptrCast(&addr_in), &addr_len, 0) catch unreachable;
 
         return .{
             .client = .{ .handle = client },
@@ -187,25 +238,25 @@ pub const SocketPair = struct {
         };
     }
 
-    pub fn deinit(self: *SocketPair) void {
+    pub fn deinit(self: *@This()) void {
         self.writer.deinit();
         // assume test closes self.server
         self.client.close();
     }
 
-    pub fn pingPayload(self: *SocketPair, payload: []const u8) void {
+    pub fn pingPayload(self: *@This(), payload: []const u8) void {
         self.writer.pingPayload(payload);
     }
 
-    pub fn textFrame(self: *SocketPair, fin: bool, payload: []const u8) void {
+    pub fn textFrame(self: *@This(), fin: bool, payload: []const u8) void {
         self.writer.textFrame(fin, payload);
     }
 
-    pub fn cont(self: *SocketPair, fin: bool, payload: []const u8) void {
+    pub fn cont(self: *@This(), fin: bool, payload: []const u8) void {
         self.writer.cont(fin, payload);
     }
 
-    pub fn sendBuf(self: *SocketPair) void {
+    pub fn sendBuf(self: *@This()) void {
         self.client.writeAll(self.writer.bytes()) catch unreachable;
         self.writer.clear();
     }
