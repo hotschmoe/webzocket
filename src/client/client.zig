@@ -408,7 +408,7 @@ fn tcpConnectToHost(host: []const u8, port: u16) !compat.socket_t {
         return error.HostResolveNotImplemented;
     };
 
-    const cloexec: u32 = if (@hasDecl(compat.SOCK, "CLOEXEC")) compat.SOCK.CLOEXEC else 0;
+    const cloexec: u32 = compat.SOCK_CLOEXEC;
 
     switch (ip_addr) {
         .ip4 => |ip4| {
