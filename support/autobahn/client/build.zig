@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    exe.root_module.addImport("websocket", b.dependency("websocket", .{}).module("websocket"));
+    exe.root_module.addImport("webzocket", b.dependency("webzocket", .{}).module("webzocket"));
 
     b.installArtifact(exe);
 

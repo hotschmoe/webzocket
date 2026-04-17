@@ -8,7 +8,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .root_source_file = b.path("src/websocket.zig"),
+        .link_libc = true,
     });
+    if (target.result.os.tag == .windows) {
+        websocket_module.linkSystemLibrary("ws2_32", .{});
+    }
 
     {
         const options = b.addOptions();
@@ -22,7 +26,6 @@ pub fn build(b: *std.Build) void {
             .root_module = websocket_module,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        tests.linkLibC();
         const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
         const options = b.addOptions();
         options.addOption(bool, "websocket_blocking", force_blocking);

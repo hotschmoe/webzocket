@@ -1,5 +1,5 @@
 const std = @import("std");
-const websocket = @import("websocket");
+const websocket = @import("webzocket");
 
 const Conn = websocket.Conn;
 const Message = websocket.Message;
@@ -13,22 +13,20 @@ pub const std_options = std.Options{ .log_scope_levels = &[_]std.log.ScopeLevel{
 var nonblocking_server: websocket.Server(Handler) = undefined;
 var nonblocking_bp_server: websocket.Server(Handler) = undefined;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
     if (@import("builtin").os.tag != .windows) {
-        defer _ = gpa.detectLeaks();
-
-        std.posix.sigaction(std.posix.SIG.TERM, &.{
-            .handler = .{ .handler = shutdown },
+        std.posix.sigaction(.TERM, &.{
+            .handler = .{ .handler = &shutdown },
             .mask = std.posix.sigemptyset(),
             .flags = 0,
         }, null);
     }
 
-    const t1 = try startNonBlocking(allocator);
-    const t2 = try startNonBlockingBufferPool(allocator);
+    const t1 = try startNonBlocking(allocator, io);
+    const t2 = try startNonBlockingBufferPool(allocator, io);
 
     t1.join();
     t2.join();
@@ -37,55 +35,41 @@ pub fn main() !void {
     nonblocking_bp_server.deinit();
 }
 
-fn startNonBlocking(allocator: Allocator) !std.Thread {
-    nonblocking_server = try websocket.Server(Handler).init(allocator, .{
+fn startNonBlocking(allocator: Allocator, io: std.Io) !std.Thread {
+    nonblocking_server = try websocket.Server(Handler).init(allocator, io, .{
         .port = 9224,
         .address = "127.0.0.1",
         .buffers = .{
             .small_pool = 0,
             .small_size = 8192,
         },
-        // autobahn tests with large messages (16MB).
-        // You almost certainly want to use a small value here.
         .max_message_size = 20_000_000,
         .handshake = .{
             .timeout = 3,
             .max_size = 1024,
             .max_headers = 10,
         },
-        // zig 0.15
-        // .compression = .{
-        //     .write_threshold = 0,
-        // },
     });
     return try nonblocking_server.listenInNewThread({});
 }
 
-fn startNonBlockingBufferPool(allocator: Allocator) !std.Thread {
-    nonblocking_bp_server = try websocket.Server(Handler).init(allocator, .{
+fn startNonBlockingBufferPool(allocator: Allocator, io: std.Io) !std.Thread {
+    nonblocking_bp_server = try websocket.Server(Handler).init(allocator, io, .{
         .port = 9225,
         .address = "127.0.0.1",
         .buffers = .{
             .small_pool = 3,
             .small_size = 8192,
         },
-        // autobahn tests with large messages (16MB).
-        // You almost certainly want to use a small value here.
         .max_message_size = 20_000_000,
         .handshake = .{
             .timeout = 3,
             .max_size = 1024,
             .max_headers = 10,
         },
-        // zig 0.15
-        // .compression = .{
-        //     .write_threshold = 0,
-        // },
     });
     return try nonblocking_bp_server.listenInNewThread({});
 }
-
-const Context = struct {};
 
 const Handler = struct {
     conn: *Conn,
@@ -102,14 +86,14 @@ const Handler = struct {
                 if (std.unicode.utf8ValidateSlice(data)) {
                     try self.conn.writeText(data);
                 } else {
-                    self.conn.close(.{.code = 1007}) catch {};
+                    self.conn.close(.{ .code = 1007 }) catch {};
                 }
             },
         }
     }
 };
 
-fn shutdown(_: c_int) callconv(.c) void {
+fn shutdown(_: std.posix.SIG) callconv(.c) void {
     nonblocking_server.stop();
     nonblocking_bp_server.stop();
 }

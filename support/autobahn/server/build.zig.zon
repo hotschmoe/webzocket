@@ -3,7 +3,8 @@
 	.paths = .{""},
 	.version = "0.0.0",
 	.fingerprint = 0x923c8c98ca4d09ab,
+	.minimum_zig_version = "0.16.0",
 	.dependencies = .{
-		.websocket = .{.path = "../../../"},
+		.webzocket = .{.path = "../../../"},
 	},
 }

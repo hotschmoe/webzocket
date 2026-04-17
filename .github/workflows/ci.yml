@@ -5,7 +5,8 @@ on:
     branches: [master]
 
 env:
-  ZIG_VERSION: "0.15.2"
+  ZIG_VERSION: "0.16.0"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   version-check:
@@ -148,3 +149,57 @@ jobs:
           EOF
 
           zig build
+
+  autobahn-server:
+    name: Autobahn Server Conformance
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Pull autobahn image
+        run: docker pull crossbario/autobahn-testsuite
+
+      - name: Run Autobahn fuzzing client against our server
+        run: make abs
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-server-reports
+          path: support/autobahn/server/reports/
+          if-no-files-found: ignore
+
+  autobahn-client:
+    name: Autobahn Client Conformance
+    needs: version-check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Pull autobahn image
+        run: docker pull crossbario/autobahn-testsuite
+
+      - name: Run our client against Autobahn fuzzing server
+        run: make abc
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-client-reports
+          path: support/autobahn/client/reports/
+          if-no-files-found: ignore

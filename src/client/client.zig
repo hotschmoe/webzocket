@@ -1,11 +1,10 @@
 const std = @import("std");
 const proto = @import("../proto.zig");
 const buffer = @import("../buffer.zig");
+const compat = @import("../posix_compat.zig");
 
 const ascii = std.ascii;
-const net = std.net;
 const posix = std.posix;
-const tls = std.crypto.tls;
 const log = std.log.scoped(.websocket);
 
 const Reader = proto.Reader;
@@ -35,6 +34,7 @@ fn ReadLoopHandler(comptime T: type) type {
 }
 
 pub const Client = struct {
+    io: std.Io,
     stream: Stream,
     _reader: Reader,
     _closed: bool,
@@ -51,7 +51,7 @@ pub const Client = struct {
     // is a security feature that only really makes sense in the browser. If you
     // aren't running websockets in the browser AND you control both the client
     // and the server, you could get a performance boost by not masking.
-    _mask_fn: *const fn () [4]u8,
+    _mask_fn: *const fn (std.Io) [4]u8,
 
     pub const Config = struct {
         port: u16,
@@ -60,7 +60,7 @@ pub const Client = struct {
         max_size: usize = 65536,
         buffer_size: usize = 4096,
         ca_bundle: ?Bundle = null,
-        mask_fn: *const fn () [4]u8 = generateMask,
+        mask_fn: *const fn (std.Io) [4]u8 = generateMask,
         buffer_provider: ?*buffer.Provider = null,
         compression: ?CompressionOpts = null,
     };
@@ -77,19 +77,24 @@ pub const Client = struct {
         writer: std.Io.Writer.Allocating,
     };
 
-    pub fn init(allocator: Allocator, config: Config) !Client {
+    pub fn init(allocator: Allocator, io: std.Io, config: Config) !Client {
         if (config.compression != null) {
             log.err("Compression is disabled as part of the 0.15 upgrade. I do hope to re-enable it soon.", .{});
             return error.InvalidConfiguraion;
         }
 
-        const net_stream = try net.tcpConnectToHost(allocator, config.host, config.port);
-
-        var tls_client: ?*TLSClient = null;
         if (config.tls) {
-            tls_client = try TLSClient.init(allocator, net_stream, &config);
+            // TLS migration is deferred — the 0.16 tls.Client API requires
+            // Reader/Writer abstractions and caller-supplied entropy that need
+            // a separate pass.  Return a clear error rather than leaving the
+            // code in a broken state.
+            return error.TlsNotYetMigrated;
         }
-        const stream = Stream.init(net_stream, tls_client);
+
+        const sock = try tcpConnectToHost(config.host, config.port);
+        errdefer compat.close(sock);
+
+        const stream = Stream.init(.{ .handle = sock });
 
         var own_bp = false;
         var buffer_provider: *buffer.Provider = undefined;
@@ -103,7 +108,7 @@ pub const Client = struct {
             own_bp = true;
             buffer_provider = try allocator.create(buffer.Provider);
             errdefer allocator.destroy(buffer_provider);
-            buffer_provider.* = try buffer.Provider.init(allocator, .{
+            buffer_provider.* = try buffer.Provider.init(allocator, io, .{
                 .size = 0,
                 .count = 0,
                 .max = config.max_size,
@@ -119,6 +124,7 @@ pub const Client = struct {
         errdefer buffer_provider.allocator.free(reader_buf);
 
         return .{
+            .io = io,
             .stream = stream,
             ._closed = false,
             ._own_bp = own_bp,
@@ -151,14 +157,14 @@ pub const Client = struct {
         // we might as well use it!
         const buf = self._reader.static;
         const key = blk: {
-            const bin_key = generateKey();
+            const bin_key = generateKey(self.io);
             var encoded_key: [24]u8 = undefined;
             break :blk std.base64.standard.Encoder.encode(&encoded_key, &bin_key);
         };
 
         try sendHandshake(path, key, buf, &opts, self._compression_opts != null, stream);
 
-        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream);
+        const res = try HandShakeReply.read(buf, key, &opts, self._compression_opts != null, stream, self.io);
         errdefer self.close(.{ .code = 1001 }) catch unreachable;
 
         // Set up compression with agreed-on parameters
@@ -375,7 +381,7 @@ pub const Client = struct {
 
         buf[1] |= 128; // indicate that the payload is masked
 
-        const mask = self._mask_fn();
+        const mask = self._mask_fn(self.io);
         @memcpy(buf[header_len..header_end], &mask);
         try self.stream.writeAll(buf[0..header_end]);
 
@@ -392,83 +398,84 @@ pub const Client = struct {
     }
 };
 
-// wraps a net.Stream and optional a tls.Client
-pub const Stream = struct {
-    stream: net.Stream,
-    tls_client: ?*TLSClient = null,
+// Resolve hostname/IP and connect a TCP socket. Returns the connected socket fd.
+// Supports IP address literals (IPv4 and IPv6). Hostname DNS resolution is not
+// yet implemented — callers with non-IP hostnames will get error.HostResolveNotImplemented.
+fn tcpConnectToHost(host: []const u8, port: u16) !compat.socket_t {
+    // Try parsing as an IP address literal first (no Io needed, pure function).
+    const ip_addr = std.Io.net.IpAddress.parse(host, port) catch {
+        // TODO: implement hostname DNS resolution via std.Io.net.HostName.resolve
+        return error.HostResolveNotImplemented;
+    };
 
-    pub fn init(stream: net.Stream, tls_client: ?*TLSClient) Stream {
+    const cloexec: u32 = compat.SOCK_CLOEXEC;
+
+    switch (ip_addr) {
+        .ip4 => |ip4| {
+            const sock = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | cloexec, compat.IPPROTO.TCP);
+            errdefer compat.close(sock);
+
+            var addr_in = compat.sockaddr.in{
+                .family = compat.AF.INET,
+                .port = std.mem.nativeToBig(u16, ip4.port),
+                .addr = @bitCast(ip4.bytes),
+                .zero = @splat(0),
+            };
+            try compat.connect(sock, @ptrCast(&addr_in), @sizeOf(compat.sockaddr.in));
+            return sock;
+        },
+        .ip6 => |ip6| {
+            const sock = try compat.socket(compat.AF.INET6, compat.SOCK.STREAM | cloexec, compat.IPPROTO.TCP);
+            errdefer compat.close(sock);
+
+            var addr_in6 = compat.sockaddr.in6{
+                .family = compat.AF.INET6,
+                .port = std.mem.nativeToBig(u16, ip6.port),
+                .flowinfo = 0,
+                .addr = ip6.bytes,
+                .scope_id = 0,
+            };
+            try compat.connect(sock, @ptrCast(&addr_in6), @sizeOf(compat.sockaddr.in6));
+            return sock;
+        },
+    }
+}
+
+// Wraps a compat.Stream and optionally a TLS client.
+// TLS support is not yet migrated to 0.16; the tls field is always null.
+pub const Stream = struct {
+    net_stream: compat.Stream,
+
+    pub fn init(net_stream: compat.Stream) Stream {
         return .{
-            .stream = stream,
-            .tls_client = tls_client,
+            .net_stream = net_stream,
         };
     }
 
     pub fn close(self: *Stream) void {
-        const fd = self.stream.handle;
-        const builtin = @import("builtin");
-        const native_os = builtin.os.tag;
-
-        if (self.tls_client) |tls_client| {
-            // Shutdown the socket first, so readLoop() can exit, before tls_client's buffers are freed
-            if (native_os == .windows) {
-                _ = std.os.windows.ws2_32.shutdown(fd, std.os.windows.ws2_32.SD_BOTH);
-            } else if (native_os == .wasi and !builtin.link_libc) {
-                _ = std.os.wasi.sock_shutdown(fd, .{ .WR = true, .RD = true });
-            } else {
-                std.posix.shutdown(fd, .both) catch {};
-            }
-            tls_client.deinit();
-        }
-
-        // std.posix.close panics on EBADF
-        // This is a general issue in Zig:
-        // https://github.com/ziglang/zig/issues/6389
-        //
-        // we don't want to crash on double close
-
-        if (native_os == .windows) {
-            return std.os.windows.CloseHandle(fd);
-        }
-        if (native_os == .wasi and !builtin.link_libc) {
-            _ = std.os.wasi.fd_close(fd);
-            return;
-        }
+        const fd = self.net_stream.handle;
+        // Shutdown before close so any blocked reads/writes exit.
+        compat.shutdown(fd, .both) catch {};
+        // std.posix.close panics on EBADF (https://github.com/ziglang/zig/issues/6389)
+        // Use the raw syscall to avoid crashing on double close.
         _ = std.posix.system.close(fd);
     }
 
     pub fn read(self: *Stream, buf: []u8) !usize {
-        if (self.tls_client) |tls_client| {
-            var w: std.Io.Writer = .fixed(buf);
-            while (true) {
-                const n = try tls_client.client.reader.stream(&w, .limited(buf.len));
-                if (n != 0) {
-                    return n;
-                }
-            }
-        }
-        return self.stream.read(buf);
+        return self.net_stream.read(buf);
     }
 
     pub fn writeAll(self: *Stream, data: []const u8) !void {
-        if (self.tls_client) |tls_client| {
-            try tls_client.client.writer.writeAll(data);
-            // I know this looks silly, but as far as I can tell, this is what
-            // we need to do.
-            try tls_client.client.writer.flush();
-            try tls_client.stream_writer.interface.flush();
-            return;
-        }
-        return self.stream.writeAll(data);
+        return self.net_stream.writeAll(data);
     }
 
-    const zero_timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 0 });
+    const zero_timeout = std.mem.toBytes(compat.timeval{ .sec = 0, .usec = 0 });
     pub fn writeTimeout(self: *const Stream, ms: u32) !void {
-        return self.setTimeout(posix.SO.SNDTIMEO, ms);
+        return self.setTimeout(compat.SO.SNDTIMEO, ms);
     }
 
     pub fn readTimeout(self: *const Stream, ms: u32) !void {
-        return self.setTimeout(posix.SO.RCVTIMEO, ms);
+        return self.setTimeout(compat.SO.RCVTIMEO, ms);
     }
 
     fn setTimeout(self: *const Stream, opt_name: u32, ms: u32) !void {
@@ -476,7 +483,7 @@ pub const Stream = struct {
             return self.setsockopt(opt_name, &zero_timeout);
         }
 
-        const timeout = std.mem.toBytes(posix.timeval{
+        const timeout = std.mem.toBytes(compat.timeval{
             .sec = @intCast(@divTrunc(ms, 1000)),
             .usec = @intCast(@mod(ms, 1000) * 1000),
         });
@@ -484,79 +491,32 @@ pub const Stream = struct {
     }
 
     pub fn setsockopt(self: *const Stream, opt_name: u32, value: []const u8) !void {
-        return posix.setsockopt(self.stream.handle, posix.SOL.SOCKET, opt_name, value);
-    }
-};
-
-const TLSClient = struct {
-    client: tls.Client,
-    stream: net.Stream,
-    stream_writer: net.Stream.Writer,
-    stream_reader: net.Stream.Reader,
-    arena: std.heap.ArenaAllocator,
-
-    fn init(allocator: Allocator, stream: net.Stream, config: *const Client.Config) !*TLSClient {
-        var arena = std.heap.ArenaAllocator.init(allocator);
-        errdefer arena.deinit();
-
-        const aa = arena.allocator();
-
-        const bundle = config.ca_bundle orelse blk: {
-            var b = Bundle{};
-            try b.rescan(aa);
-            break :blk b;
-        };
-
-        // The TLS input and output have to be max_ciphertext_record_len each.
-        // It isn't clear to me how big the un-encrypted reader and writer
-        // need to be. I would think 0, but that will fail an assertion. I
-        // don't think that it's right that we need 4 buffers, but apparently
-        // we do. Until i figure this out, using 4 x max_ciphertext_record_len
-        // seems like the only safe choice.
-        const buf_len = std.crypto.tls.max_ciphertext_record_len;
-        var buf = try aa.alloc(u8, buf_len * 4);
-
-        const self = try aa.create(TLSClient);
-        self.* = .{
-            .stream = stream,
-            .arena = arena,
-            .client = undefined,
-            .stream_writer = stream.writer(buf.ptr[0..buf_len][0..buf_len]),
-            .stream_reader = stream.reader(buf.ptr[buf_len .. 2 * buf_len][0..buf_len]),
-        };
-
-        self.client = try tls.Client.init(
-            self.stream_reader.interface(),
-            &self.stream_writer.interface,
-            .{
-                .ca = .{ .bundle = bundle },
-                .host = .{ .explicit = config.host },
-                .read_buffer = buf.ptr[2 * buf_len .. 3 * buf_len][0..buf_len],
-                .write_buffer = buf.ptr[3 * buf_len .. 4 * buf_len][0..buf_len],
-            },
+        const rc = std.posix.system.setsockopt(
+            self.net_stream.handle,
+            std.posix.SOL.SOCKET,
+            opt_name,
+            value.ptr,
+            @intCast(value.len),
         );
-
-        return self;
-    }
-
-    fn deinit(self: *TLSClient) void {
-        _ = self.client.end() catch {};
-        self.arena.deinit();
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {},
+            else => return error.Unexpected,
+        }
     }
 };
 
-fn generateKey() [16]u8 {
+fn generateKey(io: std.Io) [16]u8 {
     if (comptime @import("builtin").is_test) {
         return [16]u8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
     }
     var key: [16]u8 = undefined;
-    std.crypto.random.bytes(&key);
+    io.random(&key);
     return key;
 }
 
-fn generateMask() [4]u8 {
+fn generateMask(io: std.Io) [4]u8 {
     var m: [4]u8 = undefined;
-    std.crypto.random.bytes(&m);
+    io.random(&m);
     return m;
 }
 
@@ -617,9 +577,11 @@ const HandShakeReply = struct {
     compression: bool,
     over_read: usize,
 
-    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype) !HandShakeReply {
+    fn read(buf: []u8, key: []const u8, opts: *const Client.HandshakeOpts, compression: bool, stream: anytype, io: std.Io) !HandShakeReply {
         const timeout_ms = opts.timeout_ms;
-        const deadline = std.time.milliTimestamp() + timeout_ms;
+        // Compute a deadline in milliseconds using the realtime clock.
+        const start_ts = std.Io.Timestamp.now(io, .real);
+        const deadline_ns = start_ts.nanoseconds + @as(i96, timeout_ms) * std.time.ns_per_ms;
         try stream.readTimeout(timeout_ms);
 
         var pos: usize = 0;
@@ -727,7 +689,7 @@ const HandShakeReply = struct {
                 }
             }
 
-            if (std.time.milliTimestamp() > deadline) {
+            if (std.Io.Timestamp.now(io, .real).nanoseconds > deadline_ns) {
                 return error.Timeout;
             }
 
@@ -897,7 +859,7 @@ test "Client: handshake" {
 }
 
 test "Client: write/read" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.allocator, t.getIo(), .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -919,7 +881,7 @@ test "Client: write/read" {
 }
 
 test "Client: close with code" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.allocator, t.getIo(), .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -933,7 +895,7 @@ test "Client: close with code" {
 }
 
 test "Client: with code and reason" {
-    var client = try Client.init(t.allocator, .{
+    var client = try Client.init(t.allocator, t.getIo(), .{
         .port = 9292,
         .host = "127.0.0.1",
     });
@@ -979,18 +941,20 @@ test "Client: Handler" {
     try t.expectEqual(true, h.closed);
 }
 
-fn testClient(stream: net.Stream) Client {
+fn testClient(stream: compat.Stream) Client {
+    const io = t.getIo();
     const bp = t.allocator.create(buffer.Provider) catch unreachable;
-    bp.* = buffer.Provider.init(t.allocator, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
+    bp.* = buffer.Provider.init(t.allocator, io, .{ .count = 0, .size = 0, .max = 4096 }) catch unreachable;
 
     const reader_buf = bp.allocator.alloc(u8, 1024) catch unreachable;
 
     return .{
+        .io = io,
         ._closed = false,
         ._own_bp = true,
         ._mask_fn = generateMask,
         ._compression_opts = null,
-        .stream = .{ .stream = stream },
+        .stream = .{ .net_stream = stream },
         ._reader = Reader.init(reader_buf, bp, null),
     };
 }
@@ -1003,7 +967,7 @@ const ClientHandler = struct {
     client: Client,
 
     fn init(allocator: Allocator) !ClientHandler {
-        var client = try Client.init(allocator, .{
+        var client = try Client.init(allocator, t.getIo(), .{
             .port = 9292,
             .host = "127.0.0.1",
         });
