@@ -19,7 +19,7 @@ pub fn main(init: std.process.Init) !void {
 
     if (@import("builtin").os.tag != .windows) {
         std.posix.sigaction(.TERM, &.{
-            .handler = .{ .handler = shutdown },
+            .handler = .{ .handler = &shutdown },
             .mask = std.posix.sigemptyset(),
             .flags = 0,
         }, null);
@@ -93,7 +93,7 @@ const Handler = struct {
     }
 };
 
-fn shutdown(_: c_int) callconv(.c) void {
+fn shutdown(_: std.posix.SIG) callconv(.c) void {
     nonblocking_server.stop();
     nonblocking_bp_server.stop();
 }
