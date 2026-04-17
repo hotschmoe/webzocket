@@ -42,6 +42,10 @@ pub fn frameBin(comptime msg: []const u8) [proto.calculateFrameLen(msg)]u8 {
 
 comptime {
     std.testing.refAllDecls(@This());
+    // WIP Io-native server — compiled in so its tests + compile errors
+    // surface during the redesign. Not yet re-exported. See task #3 in
+    // migration_progress.md.
+    _ = @import("server/server_io.zig");
 }
 
 const t = @import("t.zig");
