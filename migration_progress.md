@@ -15,6 +15,25 @@ Conventions:
 
 ## Task #3 — Rewrite server.zig around Io.async (IN PROGRESS)
 
+**Current checkpoint** (`eb49a59` + follow-up): `server_io.zig` compiles,
+existing 33/33 tests still green, one skipped smoke test
+(`server_io: handshake + echo`) captures the intended usage. The skipped
+test hangs on Windows because:
+
+- `net.Server` accept on Windows goes through `netAcceptWindows` →
+  `deviceIoControl(AFD.WAIT_FOR_LISTEN)`. The implementation asserts
+  `CANCELLED => unreachable`, so closing the listener socket mid-accept
+  from `stop()` panics inside the stdlib.
+- The intended shutdown primitive is `Group.cancel`, which translates
+  into `error.Canceled` on the pending `deviceIoControl`. Whether this
+  also unblocks a pending `netRead` for a serveOne frame's read-loop on
+  Windows is not yet verified — probably needs per-conn `Cancelable`
+  token plumbing (task #5).
+
+Next step on task #3: get the smoke test (or a shorter variant)
+passing so we can delete the old server.zig. Until then we keep the
+file around but the compiler sees both.
+
 **Step 1: map the current server.zig** ✅ — done. Key takeaways:
 - `server.zig` is ~1731 lines. The top-level `Server(H)` is relatively
   thin; most weight is in `Blocking(H)` (line 346) and
