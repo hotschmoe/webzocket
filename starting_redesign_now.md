@@ -116,9 +116,28 @@ blocker for the core port.
 
 ## Plan
 
-1. **Windows Io viability check (day 0–2).** Tiny throwaway program:
-   `std.Io` TCP listener, accept, echo bytes. On Windows. If this doesn't
-   work cleanly, stop and reassess before rewriting the library.
+1. **Windows Io viability check (day 0–2). — DONE ✅**
+   See `spike/io_echo/`. Single binary: `Io.Threaded` backend, listen on
+   127.0.0.1:9223, spawn accept half via `Io.async`, client half runs on
+   main, 16-byte echo round-trips cleanly. Key findings:
+   - `Io.Threaded` is the only Windows backend in 0.16. No fibers on Windows
+     — "green frames" on this platform are really Threaded-scheduled frames.
+     That's fine for us; the vtable surface is identical.
+   - TCP API shape: `net.IpAddress.listen(&addr, io, opts)` → `Server`;
+     `server.accept(io)` → `Stream`; `stream.reader(io, buf)` and
+     `stream.writer(io, buf)` produce buffered `Io.Reader`/`Io.Writer`
+     wrappers. IOCP is hidden inside `Io.Threaded`'s vtable — we never
+     touch Win32 directly.
+   - `Io.async(io, fn, args)` is a plain function call (no `async`/`await`
+     keywords in 0.16). Returns `Future(Result)`; `.await(io)` to wait,
+     `.cancel(io)` to request cancellation.
+   - `Stream.Writer` is buffered. `writeAll` then `flush` is mandatory —
+     the drain only fires on flush or buffer pressure.
+   - 0.16 allocator API note: `GeneralPurposeAllocator` → `DebugAllocator`,
+     init pattern is `: .init` not `: .{}`.
+   **Conclusion:** the "one Io-driven path per platform" bet holds on
+   Windows. Proceed to the library rewrite.
+
 2. **Port `Reader` to `Io.Reader` input (day 2–4).** Most invasive internal
    change, orthogonal to the handler API break. Do it with the current
    server scaffolding still in place; verify with existing unit tests before

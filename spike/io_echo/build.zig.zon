@@ -1,0 +1,12 @@
+.{
+    .name = .io_echo_spike,
+    .version = "0.0.0",
+    .fingerprint = 0xcf00ee4dce8e4524,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "main.zig",
+    },
+}
