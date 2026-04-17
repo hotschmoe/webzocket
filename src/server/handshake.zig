@@ -92,7 +92,7 @@ pub const Handshake = struct {
                     }
                     required_headers |= 2;
                 },
-                .@"sec-websocket-extensions" => compression = try parseExtension(value),
+                .@"sec-websocket-extensions" => compression = parseExtension(value) catch null,
                 .none => {},
             }
 
@@ -168,49 +168,60 @@ pub const Handshake = struct {
     }
 
     pub fn parseExtension(value: []const u8) !?Handshake.Compression {
-        var deflate = false;
-        var server_max_bits: u8 = 15;
-        var client_no_context_takeover = false;
-        var server_no_context_takeover = false;
+        // Sec-WebSocket-Extensions is a comma-separated list of offers, each
+        // of which is a semicolon-separated extension name + parameters. Per
+        // RFC 7692 §5.1, a server that doesn't accept a permessage-deflate
+        // offer MUST complete the handshake without it — it MUST NOT reject.
+        // So: walk every offer, and return the first one we can honor. Any
+        // offer with a value we can't parse is skipped, not an error.
+        var offers = std.mem.splitScalar(u8, value, ',');
+        while (offers.next()) |offer| {
+            var deflate = false;
+            var server_max_bits: u8 = 15;
+            var client_no_context_takeover = false;
+            var server_no_context_takeover = false;
+            var offer_rejected = false;
 
-        var it = std.mem.splitScalar(u8, value, ';');
-        while (it.next()) |param_| {
-            const param = std.mem.trim(u8, param_, &ascii.whitespace);
-            if (std.mem.eql(u8, param, "permessage-deflate")) {
-                deflate = true;
+            var it = std.mem.splitScalar(u8, offer, ';');
+            while (it.next()) |param_| {
+                const param = std.mem.trim(u8, param_, &ascii.whitespace);
+                if (std.mem.eql(u8, param, "permessage-deflate")) {
+                    deflate = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, param, "client_no_context_takeover")) {
+                    client_no_context_takeover = true;
+                    continue;
+                }
+                if (std.mem.eql(u8, param, "server_no_context_takeover")) {
+                    server_no_context_takeover = true;
+                    continue;
+                }
+                const server_max_window_bits = "server_max_window_bits=";
+                if (std.mem.startsWith(u8, param, server_max_window_bits)) {
+                    server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
+                        offer_rejected = true;
+                        break;
+                    };
+                }
+            }
+
+            if (offer_rejected or !deflate) continue;
+
+            if (server_max_bits != 15) {
+                // Zig doesn't support a sliding deflate window. If the client asks
+                // for a sliding window < 15, we can't accomodate it. Skip this
+                // offer and try the next one.
                 continue;
             }
-            if (std.mem.eql(u8, param, "client_no_context_takeover")) {
-                client_no_context_takeover = true;
-                continue;
-            }
-            if (std.mem.eql(u8, param, "server_no_context_takeover")) {
-                server_no_context_takeover = true;
-                continue;
-            }
-            const server_max_window_bits = "server_max_window_bits=";
-            if (std.mem.startsWith(u8, param, server_max_window_bits)) {
-                server_max_bits = std.fmt.parseInt(u8, param[server_max_window_bits.len..], 10) catch {
-                    return error.InvalidCompressionServerMaxBits;
-                };
-            }
-        }
-        if (deflate == false) {
-            return null;
+
+            return .{
+                .client_no_context_takeover = client_no_context_takeover,
+                .server_no_context_takeover = server_no_context_takeover,
+            };
         }
 
-        if (server_max_bits != 15) {
-            // Zig doesn't support a sliding deflate window. If the client asks
-            // for a sliding window < 15, we can't accomodate it. This logic
-            // should be pushed into the worker, but putting it here makes it
-            // easier for any integration to also use this (i..e httz)
-            return null;
-        }
-
-        return .{
-            .client_no_context_takeover = client_no_context_takeover,
-            .server_no_context_takeover = server_no_context_takeover,
-        };
+        return null;
     }
 
     // This is what we're pooling
@@ -516,6 +527,76 @@ test "handshake: parse" {
         }
 
         try t.expectEqual(null, it.next());
+    }
+}
+
+test "handshake: tolerates malformed compression offers" {
+    var pool = try Pool.init(t.allocator, t.getIo(), 1, 512, 10, 1);
+    defer pool.deinit();
+
+    const base = "GET / HTTP/1.1\r\nConnection: upgrade\r\nUpgrade: websocket\r\nsec-websocket-version:13\r\nsec-websocket-key: 9000!\r\n";
+
+    // Autobahn 13.7.1: comma-separated multi-offer. The old parser fed the
+    // whole string to parseInt and returned InvalidCompressionServerMaxBits,
+    // which bubbled up to HTTP 400. Now the handshake must succeed; the third
+    // offer (`permessage-deflate; client_max_window_bits`) is a clean
+    // permessage-deflate, so compression ends up non-null. (The server still
+    // won't advertise compression in its 101 reply because Config.compression
+    // is null — but that's a separate layer.)
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=9, permessage-deflate; server_max_window_bits=0, permessage-deflate; client_max_window_bits\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try std.testing.expect(h.compression != null);
+    }
+
+    // Two offers, both with non-15 server_max_window_bits. Both are skipped,
+    // compression ends up null, handshake succeeds.
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=9, permessage-deflate; server_max_window_bits=0\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try t.expectEqual(null, h.compression);
+    }
+
+    // server_max_window_bits with a non-integer value — skip the offer, complete handshake.
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=abc\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try t.expectEqual(null, h.compression);
+    }
+
+    // Plain `permessage-deflate` still parses as a valid compression offer.
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try std.testing.expect(h.compression != null);
+    }
+
+    // Multi-offer where the first is malformed but the second is a clean
+    // permessage-deflate — we should pick up the clean offer.
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=abc, permessage-deflate\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try std.testing.expect(h.compression != null);
+    }
+
+    // Unknown extension token — no deflate offer at all, compression stays null,
+    // handshake succeeds.
+    {
+        var state = try pool.acquire();
+        defer state.release();
+        const req = base ++ "Sec-WebSocket-Extensions: x-mystery-extension; foo=bar\r\n\r\n";
+        const h = (try testHandshake(req, state)).?;
+        try t.expectEqual(null, h.compression);
     }
 }
 

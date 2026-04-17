@@ -613,6 +613,31 @@ test "Reader: read too large over multiple fragments" {
     try t.expectError(error.TooLarge, testRead(&reader, pair));
 }
 
+// Regression guard for the non-blocking cleanup path: if a connection is torn
+// down while a fragmented message is in flight, the Reader owns a Fragmented
+// buffer that must be freed by Reader.deinit. Autobahn-under-DebugAllocator
+// was reporting leaks here pre-fix.
+test "Reader: deinit during in-flight fragment does not leak" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+    pair.textFrame(false, "hello ");
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 128, .static = 64 });
+    // NOTE: no `defer reader.deinit()` in the loop — we call it explicitly
+    // after the partial read so a leak in the fragment path would surface.
+    try reader.fill(pair.server);
+    // Non-FIN text frame stashes a Fragmented and returns null (more data needed).
+    try t.expectEqual(null, try reader.read());
+    try std.testing.expect(reader.fragment != null);
+
+    // Simulate the server tearing down mid-fragment. If Reader.deinit doesn't
+    // free fragment.buf, std.testing.allocator will fail the test.
+    reader.deinit();
+}
+
 test "Reader: exact read into static with no overflow" {
     defer t.reset();
 
