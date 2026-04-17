@@ -15,15 +15,135 @@ Conventions:
 
 ## Task #3 — Rewrite server.zig around Io.async (IN PROGRESS)
 
-**Step 1: map the current server.zig** — pending.
+**Step 1: map the current server.zig** ✅ — done. Key takeaways:
+- `server.zig` is ~1731 lines. The top-level `Server(H)` is relatively
+  thin; most weight is in `Blocking(H)` (line 346) and
+  `NonBlocking(H, C)` (line 521). Blocking does one-thread-per-conn.
+  NonBlocking runs a shared `Loop` (EPoll/KQueue wrapper) + a
+  `ThreadPool(dataAvailable)` that fires on socket readiness events.
+- `Conn` (line 1394) already uses `Io.Mutex` for write serialization.
+  That mutex stays. `posix.Stream` inside it is what changes —
+  becomes `net.Stream`.
+- Handshake is parsed in a worker thread (blocking or pool), bytes
+  accumulated over multiple read ticks via a separate `handshake` state
+  on `HandlerConn`. NonBlocking maintains two linked lists: `pending`
+  (handshake in flight) and `active` (upgraded). The pending list goes
+  away in the rewrite — a green frame just `awaits` the handshake
+  bytes naturally.
+- Shutdown: NonBlocking uses a per-worker shutdown pipe; Blocking uses
+  `shutdown(.recv)` on accept + per-conn. The rewrite uses
+  `Io.Group.cancel` + `net.Server.deinit` (cancels pending accept).
+- posix_compat is everywhere in server.zig: `socket`, `bind`, `listen`,
+  `accept`, `read`, `writev`, `close`, `shutdown`, `fcntl`,
+  `setsockopt`, `epoll_*`, `kqueue`, `pipe2`, `getsockname`. All of
+  these move to `std.Io.net.*` or disappear.
 
-Plan of attack for this task (4 steps):
-1. Read the full current `server.zig` (1700+ lines); summarize accept
-   loop, Conn, handshake wiring, dispatch, shutdown.
-2. Sketch the new structure in a short design note (inlined here).
-3. Implement the new path alongside the old; only delete the old once
-   the new one passes a smoke test.
-4. Port server-side tests one by one.
+**Step 2: target structure** (design sketch):
+
+```zig
+pub fn Server(comptime H: type) type {
+    return struct {
+        io: Io,
+        allocator: Allocator,
+        config: Config,
+        _state: WorkerState,          // handler pool, buffer provider, compression
+        _listener: ?net.Server,       // set on listen(), cleared on stop()
+        _shutdown: std.atomic.Value(bool),
+        _group: Io.Group,             // owns all in-flight serveOne frames
+        _group_lock: Io.Mutex,
+
+        pub fn init(alloc, io, config) !Self
+        pub fn deinit(self: *Self) void
+        pub fn listen(self: *Self, ctx) !void         // blocks current frame; runs accept loop
+        pub fn stop(self: *Self) void                 // sets _shutdown, closes listener,
+                                                      //   cancels group; accept() wakes up
+    };
+}
+
+fn acceptLoop(self: *Self, ctx: Ctx) !void {
+    while (!self._shutdown.load(.acquire)) {
+        const stream = self._listener.?.accept(self.io) catch |err| switch (err) {
+            error.Canceled, error.SocketNotListening => break,
+            else => { log.warn(...); continue; },
+        };
+        self._group.async(self.io, serveOne, .{ self, stream, ctx });
+        // Group.async return is Cancelable!void-coerced; no Future to manage.
+    }
+    self._group.await(self.io) catch {}; // drain in-flight conns on shutdown
+}
+
+fn serveOne(self: *Self, stream: net.Stream, ctx: Ctx) Cancelable!void {
+    defer stream.close(self.io);
+
+    var read_buf: [...]u8 = undefined;        // handshake + static proto buffer
+    var write_buf: [...]u8 = undefined;
+    var io_reader = stream.reader(self.io, &read_buf);
+    var io_writer = stream.writer(self.io, &write_buf);
+
+    var conn = Conn.init(self.io, stream, &io_writer) catch return;
+    defer conn.deinit();
+
+    const hs = doHandshake(&conn, &io_reader.interface) catch |err| {
+        reply400(&io_writer.interface, err) catch {};
+        return;
+    };
+
+    var handler = H.init(&hs, &conn, ctx) catch return;
+    defer if (hasClose(H)) handler.close();
+    if (hasAfterInit(H)) handler.afterInit(ctx) catch return;
+
+    // Re-use proto.Reader, fed from the same io_reader that parsed the
+    // handshake (any over-read bytes already buffered are fine).
+    var static_buf: [...]u8 = undefined;
+    var reader = proto.Reader.init(&static_buf, self._state.buffer_provider, compression);
+    defer reader.deinit();
+
+    messageLoop(H, &handler, &conn, &reader, &io_reader.interface, ctx);
+}
+```
+
+What disappears:
+- `Blocking(H)` / `NonBlocking(H, C)` / `Loop` / `EPoll` / `KQueue`.
+- `ConnManager` + pending/active linked lists.
+- `handshake_pool` — handshake state is a stack variable in the green
+  frame.
+- Per-worker shutdown pipe.
+- `posix_compat` usage from server.zig (task #3 scope; the module itself
+  is still referenced by `client.zig` and `t.zig` until #3.5).
+
+What stays:
+- `Conn` — field types change (`net.Stream`, `Io.Writer`) but the
+  public API (write, writeText, close, etc.) is preserved.
+- `WorkerState` and its pools (handshake, buffer_provider).
+- `proto.Reader` + `fillIo` from task #2.
+- `Handshake.parse` / `Handshake.createReply`.
+- `ThreadPool` — retained but demoted to optional CPU offload
+  (task #4 wires it up as `conn.offload`).
+
+Handler API break:
+- `clientMessage(conn, msg)` stays the top-level contract. `Io` is
+  reachable via `conn.io`. No separate Io parameter needed.
+- All four overloads (simple / +TextType / +Allocator / +TextType +Allocator)
+  are preserved for now.
+
+**Step 2.5: test strategy.**
+- `testing.Testing` harness currently drives handlers through a real
+  socket pair + in-memory proto.Reader. Rewrite that to use
+  `net.IpAddress.listen` + `connect` for a loopback pair — same shape,
+  but all bytes go through the real `Io` path.
+- Existing server tests (`Server: read and write`, etc.) should keep
+  working against the new `Server(H)` with minimal changes since the
+  public API is stable.
+
+**Step 3: implement alongside the old.**
+- New file: `src/server/server_io.zig`. Builds but is not exported yet.
+- `websocket.zig` keeps pointing at the old `server.zig`.
+- Ship a minimal smoke test that echoes one message end-to-end
+  against `server_io.zig`. Then port handshake tests, then message
+  tests, then shutdown tests.
+- Once the new path is green on the existing test set, swap
+  `websocket.zig` to export from `server_io.zig`, delete old
+  `server.zig`, rename `server_io.zig → server.zig`.
 
 ---
 
