@@ -180,7 +180,13 @@ pub fn Server(comptime H: type) type {
             };
 
             // Build sockaddr for bind and determine socket family / protocol.
-            var bind_addr: posix.sockaddr = undefined;
+            // Use sockaddr.storage because base sockaddr only guarantees 2-byte
+            // alignment, but sockaddr.in (u32 addr field) needs 4-byte alignment
+            // and sockaddr.in6 / sockaddr.un need larger alignment still. An
+            // @alignCast onto *sockaddr.in in ipAddrToSockaddr would panic at
+            // runtime with "incorrect alignment" if the backing storage has
+            // only sockaddr alignment.
+            var bind_addr: posix.sockaddr.storage = undefined;
             var bind_addr_len: posix.socklen_t = undefined;
             const socket_family: u32 = switch (resolved) {
                 .ip => |ip| switch (ip) {
@@ -192,10 +198,10 @@ pub fn Server(comptime H: type) type {
 
             switch (resolved) {
                 .ip => |ip| {
-                    bind_addr_len = ipAddrToSockaddr(ip, &bind_addr);
+                    bind_addr_len = ipAddrToSockaddr(ip, @ptrCast(&bind_addr));
                 },
                 .unix => |path| {
-                    bind_addr_len = unixPathToSockaddr(path, &bind_addr);
+                    bind_addr_len = unixPathToSockaddr(path, @ptrCast(&bind_addr));
                 },
             }
 
@@ -227,7 +233,7 @@ pub fn Server(comptime H: type) type {
             }
 
             {
-                try posix.bind(socket, &bind_addr, bind_addr_len);
+                try posix.bind(socket, @ptrCast(&bind_addr), bind_addr_len);
                 try posix.listen(socket, 1024); // kernel backlog
             }
 
