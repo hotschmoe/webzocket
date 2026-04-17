@@ -387,7 +387,7 @@ pub fn Blocking(comptime H: type) type {
                 var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
                 const accept_flags: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
                 const socket = posix.accept(listener, @ptrCast(&addr_storage), &addr_len, accept_flags) catch |err| {
-                    if (err == error.ConnectionAborted or err == error.SocketNotListening) {
+                    if (err == error.ConnectionAborted or err == error.SocketNotListening or err == error.FileDescriptorNotASocket) {
                         log.info("received shutdown signal", .{});
                         return;
                     }

@@ -24,10 +24,15 @@ const E = std.posix.E;
 // Windows-only: WSAGetLastError() for translating Winsock errors.
 // Declared here instead of relying on std.os.windows.ws2_32 which doesn't export it.
 const WSAError = if (native_os == .windows) enum(c_int) {
+    WSAEINTR = 10004,
+    WSAEINVAL = 10022,
+    WSAEMFILE = 10024,
     WSAEWOULDBLOCK = 10035,
+    WSAENOTSOCK = 10038,
+    WSAECONNABORTED = 10053,
     WSAECONNRESET = 10054,
-    WSAETIMEDOUT = 10060,
     WSAEPIPE = 10058, // WSAESHUTDOWN (similar to EPIPE)
+    WSAETIMEDOUT = 10060,
     _,
 } else void;
 
@@ -107,9 +112,7 @@ pub const poll = std.posix.poll;
 // --- Error-translation helpers ---
 
 fn unexpectedErrno(err: E) error{Unexpected} {
-    if (std.debug.runtime_safety) {
-        std.debug.print("unexpected errno: {d} ({s})\n", .{ @intFromEnum(err), @tagName(err) });
-    }
+    _ = err;
     return error.Unexpected;
 }
 
@@ -216,26 +219,45 @@ pub const AcceptError = error{
 pub fn accept(sock: socket_t, addr: ?*sockaddr, addr_size: ?*socklen_t, flags: u32) AcceptError!socket_t {
     // accept4 is a Linux extension; not available on Windows or macOS.
     const have_accept4 = comptime native_os == .linux and @hasDecl(system, "accept4");
-    const rc = if (have_accept4)
-        system.accept4(sock, addr, addr_size, flags)
-    else
-        system.accept(sock, addr, addr_size);
     _ = if (!have_accept4) flags; // flags only used with accept4
-    switch (errno(rc)) {
-        .SUCCESS => return if (comptime native_os == .windows)
-            @as(socket_t, @ptrFromInt(@as(usize, @as(c_uint, @bitCast(rc)))))
+
+    while (true) {
+        const rc = if (have_accept4)
+            system.accept4(sock, addr, addr_size, flags)
         else
-            @intCast(rc),
-        .AGAIN => return error.WouldBlock,
-        .BADF, .NOTSOCK, .OPNOTSUPP => return error.FileDescriptorNotASocket,
-        .CONNABORTED => return error.ConnectionAborted,
-        .INVAL => return error.SocketNotListening,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        .NOBUFS, .NOMEM => return error.SystemResources,
-        .PROTO => return error.ProtocolFailure,
-        .PERM => return error.BlockedByFirewall,
-        else => |err| return unexpectedErrno(err),
+            system.accept(sock, addr, addr_size);
+
+        if (comptime native_os == .windows) {
+            const rc_signed: isize = @intCast(rc);
+            if (rc_signed < 0) {
+                const wsa_err = WSAGetLastError();
+                return switch (@as(WSAError, @enumFromInt(wsa_err))) {
+                    .WSAEINTR => continue, // interrupted; retry
+                    .WSAEWOULDBLOCK => error.WouldBlock,
+                    .WSAECONNABORTED, .WSAECONNRESET => error.ConnectionAborted,
+                    .WSAEINVAL => error.SocketNotListening,
+                    .WSAEMFILE => error.ProcessFdQuotaExceeded,
+                    .WSAENOTSOCK => error.FileDescriptorNotASocket,
+                    else => return error.Unexpected,
+                };
+            }
+            return @as(socket_t, @ptrFromInt(@as(usize, @bitCast(rc_signed))));
+        }
+
+        switch (errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.WouldBlock,
+            .BADF, .NOTSOCK, .OPNOTSUPP => return error.FileDescriptorNotASocket,
+            .CONNABORTED => return error.ConnectionAborted,
+            .INVAL => return error.SocketNotListening,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .PROTO => return error.ProtocolFailure,
+            .PERM => return error.BlockedByFirewall,
+            else => |err| return unexpectedErrno(err),
+        }
     }
 }
 
@@ -336,8 +358,7 @@ pub fn write(fd: fd_t, buf: []const u8) WriteError!usize {
             .WSAEWOULDBLOCK => error.WouldBlock,
             .WSAECONNRESET => error.ConnectionResetByPeer,
             .WSAEPIPE => error.BrokenPipe,
-            .WSAETIMEDOUT => error.Unexpected,
-            _ => error.Unexpected,
+            else => error.Unexpected,
         };
     }
     const rc = system.write(fd, buf.ptr, buf.len);
@@ -637,12 +658,15 @@ pub fn readFd(fd: fd_t, buf: []u8) ReadError!usize {
         const rc = system.recv(fd, buf.ptr, buf.len, 0);
         if (rc >= 0) return @intCast(rc);
         // rc == -1 (SOCKET_ERROR): translate WSA error to our error set.
-        return switch (@as(WSAError, @enumFromInt(WSAGetLastError()))) {
+        const wsa_err = WSAGetLastError();
+        return switch (@as(WSAError, @enumFromInt(wsa_err))) {
+            .WSAEINTR => error.WouldBlock, // treat interrupt as retryable
             .WSAEWOULDBLOCK => error.WouldBlock,
-            .WSAECONNRESET => error.ConnectionResetByPeer,
+            .WSAECONNRESET, .WSAECONNABORTED => error.ConnectionResetByPeer,
             .WSAETIMEDOUT => error.ConnectionTimedOut,
             .WSAEPIPE => error.BrokenPipe,
-            _ => error.Unexpected,
+            .WSAENOTSOCK => error.NotOpenForReading,
+            else => error.Unexpected,
         };
     }
     const rc = system.read(fd, buf.ptr, buf.len);
