@@ -13,8 +13,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const websocket = b.dependency("websocket", .{}).module("websocket");
-    exe.root_module.addImport("websocket", websocket);
+    const webzocket = b.dependency("webzocket", .{}).module("webzocket");
+    exe.root_module.addImport("webzocket", webzocket);
 
     b.installArtifact(exe);
 

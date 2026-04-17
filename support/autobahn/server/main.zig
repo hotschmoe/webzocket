@@ -1,5 +1,5 @@
 const std = @import("std");
-const websocket = @import("websocket");
+const websocket = @import("webzocket");
 
 const Conn = websocket.Conn;
 const Message = websocket.Message;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const websocket = @import("websocket");
+const websocket = @import("webzocket");
 
 const Allocator = std.mem.Allocator;
 
@@ -74,7 +74,7 @@ fn updateReport(allocator: std.mem.Allocator) !void {
     });
 
     defer client.deinit();
-    try client.handshake("/updateReports?agent=websocket.zig", .{
+    try client.handshake("/updateReports?agent=webzocket", .{
         .headers = "host: localhost:9001\r\n",
     });
 
@@ -85,7 +85,7 @@ const Handler = struct {
     client: websocket.Client,
 
     fn init(allocator: Allocator, buffer_provider: *websocket.buffer.Provider, case: []const u8) !Handler {
-        const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=websocket.zig", .{case});
+        const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=webzocket", .{case});
         defer allocator.free(path);
 
         var client = try websocket.Client.init(allocator, .{
