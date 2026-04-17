@@ -3,11 +3,14 @@ const websocket = @import("webzocket");
 
 const Allocator = std.mem.Allocator;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.detectLeaks();
+// Module-level io captured from main's std.process.Init, read by helpers
+// (updateReport, Handler.init) that don't have the Init in scope.
+var module_io: std.Io = undefined;
 
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
+    module_io = io;
 
     const cases = [_][]const u8{
         "1.1.1",   "1.1.2",   "1.1.3",   "1.1.4",   "1.1.5",   "1.1.6",   "1.1.7",   "1.1.8",   "1.2.1",   "1.2.2",   "1.2.3",   "1.2.4",   "1.2.5",   "1.2.6",   "1.2.7",   "1.2.8",
@@ -33,10 +36,10 @@ pub fn main() !void {
         "13.1.1",  "13.1.2",  "13.1.3",  "13.1.4",  "13.1.5",  "13.1.6",  "13.1.7",  "13.1.8",  "13.1.9",  "13.1.10", "13.1.11", "13.1.12", "13.1.13", "13.1.14", "13.1.15", "13.1.16", "13.1.17", "13.1.18", "13.2.1",  "13.2.2",  "13.2.3",  "13.2.4",  "13.2.5",  "13.2.6",  "13.2.7",  "13.2.8",  "13.2.9",  "13.2.10", "13.2.11", "13.2.12", "13.2.13", "13.2.14", "13.2.15", "13.2.16", "13.2.17", "13.2.18", "13.3.1",  "13.3.2",  "13.3.3",  "13.3.4",  "13.3.5",  "13.3.6",  "13.3.7",  "13.3.8",  "13.3.9",  "13.3.10", "13.3.11", "13.3.12", "13.3.13", "13.3.14", "13.3.15", "13.3.16", "13.3.17", "13.3.18", "13.4.1",  "13.4.2",  "13.4.3",  "13.4.4",  "13.4.5",  "13.4.6",  "13.4.7",  "13.4.8",  "13.4.9",  "13.4.10", "13.4.11", "13.4.12", "13.4.13", "13.4.14", "13.4.15", "13.4.16", "13.4.17", "13.4.18", "13.5.1",  "13.5.2",  "13.5.3",  "13.5.4",  "13.5.5",  "13.5.6",  "13.5.7",  "13.5.8",  "13.5.9",  "13.5.10", "13.5.11", "13.5.12", "13.5.13", "13.5.14", "13.5.15", "13.5.16", "13.5.17", "13.5.18", "13.6.1",  "13.6.2",  "13.6.3",  "13.6.4",  "13.6.5",  "13.6.6",  "13.6.7",  "13.6.8",  "13.6.9",  "13.6.10", "13.6.11", "13.6.12", "13.6.13", "13.6.14", "13.6.15", "13.6.16", "13.6.17", "13.6.18", "13.7.1",  "13.7.2",  "13.7.3",  "13.7.4",  "13.7.5",  "13.7.6",  "13.7.7",  "13.7.8",  "13.7.9",  "13.7.10", "13.7.11", "13.7.12", "13.7.13", "13.7.14", "13.7.15", "13.7.16", "13.7.17", "13.7.18",
     };
 
-    // wait 5 seconds for autobanh server to be up
-    std.Thread.sleep(std.time.ns_per_s * 5);
+    // wait 5 seconds for autobahn server to be up
+    try std.Io.sleep(io, std.Io.Duration.fromSeconds(5), .awake);
 
-    var buffer_provider = try websocket.bufferProvider(allocator, .{ .count = 10, .size = 32768, .max = 20_000_000 });
+    var buffer_provider = try websocket.bufferProvider(allocator, io, .{ .count = 10, .size = 32768, .max = 20_000_000 });
     defer buffer_provider.deinit();
 
     for (cases, 0..) |case, i| {
@@ -68,7 +71,7 @@ pub fn main() !void {
 }
 
 fn updateReport(allocator: std.mem.Allocator) !void {
-    var client = try websocket.Client.init(allocator, .{
+    var client = try websocket.Client.init(allocator, module_io, .{
         .port = 9001,
         .host = "localhost",
     });
@@ -88,14 +91,10 @@ const Handler = struct {
         const path = try std.fmt.allocPrint(allocator, "/runCase?casetuple={s}&agent=webzocket", .{case});
         defer allocator.free(path);
 
-        var client = try websocket.Client.init(allocator, .{
+        var client = try websocket.Client.init(allocator, module_io, .{
             .port = 9001,
             .host = "localhost",
             .buffer_provider = buffer_provider,
-            // zig 0.15
-            // .compression = .{
-            //     .write_threshold = 0,
-            // },
         });
         errdefer client.deinit();
         try client.handshake(path, .{
