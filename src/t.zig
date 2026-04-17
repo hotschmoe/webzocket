@@ -214,11 +214,11 @@ pub const SocketPair = struct {
         // Non-blocking connect, then restore blocking flags so the caller sees a synchronous connection.
         // fcntl is not available on Windows; on Windows we just do a plain blocking connect.
         if (comptime builtin.os.tag != .windows) {
-            const nonblock: u32 = if (@hasDecl(posix.SOCK, "NONBLOCK")) posix.SOCK.NONBLOCK else 0;
+            const o_nonblock = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
             const getfl = @field(posix.F, "GETFL");
             const setfl = @field(posix.F, "SETFL");
             const flags = compat.fcntl(client, getfl, 0) catch unreachable;
-            _ = compat.fcntl(client, setfl, flags | nonblock) catch unreachable;
+            _ = compat.fcntl(client, setfl, flags | o_nonblock) catch unreachable;
             compat.connect(client, @ptrCast(&addr_in), addr_len) catch |err| switch (err) {
                 error.WouldBlock => {},
                 else => unreachable,

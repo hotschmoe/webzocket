@@ -207,12 +207,23 @@ pub fn Server(comptime H: type) type {
 
             const socket = blk: {
                 const cloexec: u32 = posix.SOCK_CLOEXEC;
-                const nonblock: u32 = if (@hasDecl(posix.SOCK, "NONBLOCK")) posix.SOCK.NONBLOCK else 0;
+                const nonblock: u32 = posix.SOCK_NONBLOCK;
                 var sock_flags: u32 = posix.SOCK.STREAM | cloexec;
                 if (blockingMode() == false) sock_flags |= nonblock;
 
                 const socket_proto = if (socket_family == posix.AF.UNIX) @as(u32, 0) else posix.IPPROTO.TCP;
-                break :blk try posix.socket(socket_family, sock_flags, socket_proto);
+                const sock = try posix.socket(socket_family, sock_flags, socket_proto);
+
+                // On targets where socket() does not accept SOCK_NONBLOCK
+                // (e.g. macOS), SOCK_NONBLOCK is 0 — apply O_NONBLOCK via
+                // fcntl so the listener behaves the same as on Linux. Only
+                // relevant on posix non-Linux; Windows is always blocking.
+                if (comptime (blockingMode() == false and nonblock == 0)) {
+                    const flags = try posix.fcntl(sock, posix.F.GETFL, 0);
+                    const o_nonblock = @as(u32, @bitCast(posix.O{ .NONBLOCK = true }));
+                    _ = try posix.fcntl(sock, posix.F.SETFL, flags | o_nonblock);
+                }
+                break :blk sock;
             };
 
             if (no_delay) {

@@ -78,6 +78,12 @@ pub const SHUT = std.posix.SHUT;
 /// accept4, so CLOEXEC can be set atomically on both socket and accept.)
 pub const SOCK_CLOEXEC: u32 = if (native_os == .linux and @hasDecl(SOCK, "CLOEXEC")) SOCK.CLOEXEC else 0;
 
+/// SOCK_NONBLOCK flag for socket()/accept4(). Same story as SOCK_CLOEXEC:
+/// macOS declares the symbol but the socket() syscall rejects it with
+/// EPROTOTYPE. On non-Linux targets use 0 here and apply O_NONBLOCK via
+/// fcntl(F_SETFL) after the socket is created.
+pub const SOCK_NONBLOCK: u32 = if (native_os == .linux and @hasDecl(SOCK, "NONBLOCK")) SOCK.NONBLOCK else 0;
+
 pub const fd_t = std.posix.fd_t;
 pub const socket_t = std.posix.socket_t;
 pub const socklen_t = std.posix.socklen_t;
