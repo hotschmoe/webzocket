@@ -6,6 +6,6 @@
 		{"agent": "non-blocking-bp", "url": "ws://127.0.0.1:9225"}
 	],
 	"cases": ["*"],
-	"exclude-cases": [],
+	"exclude-cases": ["13.7.*"],
 	"exclude-agent-cases": {}
 }

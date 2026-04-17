@@ -206,7 +206,7 @@ pub fn Server(comptime H: type) type {
             }
 
             const socket = blk: {
-                const cloexec: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
+                const cloexec: u32 = posix.SOCK_CLOEXEC;
                 const nonblock: u32 = if (@hasDecl(posix.SOCK, "NONBLOCK")) posix.SOCK.NONBLOCK else 0;
                 var sock_flags: u32 = posix.SOCK.STREAM | cloexec;
                 if (blockingMode() == false) sock_flags |= nonblock;
@@ -391,7 +391,7 @@ pub fn Blocking(comptime H: type) type {
             while (true) {
                 var addr_storage: posix.sockaddr.storage = undefined;
                 var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-                const accept_flags: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
+                const accept_flags: u32 = posix.SOCK_CLOEXEC;
                 const socket = posix.accept(listener, @ptrCast(&addr_storage), &addr_len, accept_flags) catch |err| {
                     if (err == error.ConnectionAborted or err == error.SocketNotListening or err == error.FileDescriptorNotASocket) {
                         log.info("received shutdown signal", .{});
@@ -654,7 +654,7 @@ fn NonBlocking(comptime H: type, comptime C: type) type {
             const max_conn = self.max_conn;
             const conn_manager = &self.base.conn_manager;
 
-            const accept_flags: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
+            const accept_flags: u32 = posix.SOCK_CLOEXEC;
             while (conn_manager.count() < max_conn) {
                 var addr_storage: posix.sockaddr.storage = undefined;
                 var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
@@ -2117,8 +2117,7 @@ fn testStream(handshake: bool) !posix.Stream {
         .zero = @splat(0),
     };
     const timeout = std.mem.toBytes(posix.timeval{ .sec = 0, .usec = 20_000 });
-    const cloexec: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
-    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP);
+    const sock = try posix.socket(posix.AF.INET, posix.SOCK.STREAM | posix.SOCK_CLOEXEC, posix.IPPROTO.TCP);
     errdefer posix.close(sock);
     try posix.connect(sock, @ptrCast(&addr_in), @sizeOf(posix.sockaddr.in));
     if (comptime builtin.os.tag != .windows) {

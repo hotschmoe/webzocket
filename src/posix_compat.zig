@@ -71,6 +71,13 @@ pub const SOL = std.posix.SOL;
 pub const CLOCK = std.posix.CLOCK;
 pub const SHUT = std.posix.SHUT;
 
+/// SOCK_CLOEXEC flag for socket()/accept4() where it is both declared AND
+/// accepted by the syscall. On macOS the symbol exists in std.posix.SOCK
+/// but the socket() syscall rejects the flag with EPROTOTYPE, so we must
+/// gate to Linux only. (Linux is the only target that also provides
+/// accept4, so CLOEXEC can be set atomically on both socket and accept.)
+pub const SOCK_CLOEXEC: u32 = if (native_os == .linux and @hasDecl(SOCK, "CLOEXEC")) SOCK.CLOEXEC else 0;
+
 pub const fd_t = std.posix.fd_t;
 pub const socket_t = std.posix.socket_t;
 pub const socklen_t = std.posix.socklen_t;

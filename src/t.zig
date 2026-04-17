@@ -203,8 +203,7 @@ pub const SocketPair = struct {
         };
         var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.in);
 
-        const cloexec: u32 = if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0;
-        const listener = compat.socket(posix.AF.INET, posix.SOCK.STREAM | cloexec, posix.IPPROTO.TCP) catch unreachable;
+        const listener = compat.socket(posix.AF.INET, posix.SOCK.STREAM | compat.SOCK_CLOEXEC, posix.IPPROTO.TCP) catch unreachable;
         defer compat.close(listener);
 
         compat.bind(listener, @ptrCast(&addr_in), addr_len) catch unreachable;
