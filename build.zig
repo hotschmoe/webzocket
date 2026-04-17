@@ -31,10 +31,6 @@ pub fn build(b: *std.Build) void {
         options.addOption(bool, "websocket_blocking", force_blocking);
         tests.root_module.addOptions("build", options);
 
-        if (b.option(bool, "no-llvm", "Use self-hosted codegen (workaround for LLVM OOM under emulation)") orelse false) {
-            tests.use_llvm = false;
-        }
-
         const run_test = b.addRunArtifact(tests);
 
         const test_step = b.step("test", "Run tests");
