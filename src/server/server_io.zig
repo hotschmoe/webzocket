@@ -283,8 +283,8 @@ pub fn Server(comptime H: type) type {
         pub fn run(self: *Self, ctx: Ctx) !void {
             if (self._listener == null) return error.NotBound;
 
-            while (!self._shutdown.load(.acquire)) {
-                const stream = (&self._listener.?).accept(self.io) catch |err| switch (err) {
+            while (true) {
+                var stream = (&self._listener.?).accept(self.io) catch |err| switch (err) {
                     error.Canceled, error.SocketNotListening => break,
                     error.ConnectionAborted, error.BlockedByFirewall => {
                         log.debug("accept rejected: {}", .{err});
@@ -298,10 +298,19 @@ pub fn Server(comptime H: type) type {
                     else => return err,
                 };
 
+                // stop() wakes accept by self-connecting. We close that
+                // dummy stream and exit here — no serveOne spawn.
+                if (self._shutdown.load(.acquire)) {
+                    stream.close(self.io);
+                    break;
+                }
+
                 self._group.async(self.io, serveOne, .{ self, stream, ctx });
             }
 
-            // Drain in-flight frames.
+            // Drain in-flight frames. Each frame exits when its client
+            // closes or its stream is shut down (task #5 — proper
+            // per-connection Cancelable).
             self._group.await(self.io) catch {};
 
             self._listener_lock.lockUncancelable(self.io);
@@ -321,17 +330,19 @@ pub fn Server(comptime H: type) type {
         pub fn stop(self: *Self) void {
             self._shutdown.store(true, .release);
 
-            // Cancel all in-flight frames — both the run() accept loop and
-            // every serveOne connection frame. On Windows, closing the
-            // listener socket mid-AcceptEx would panic inside
-            // netAcceptWindows (it asserts unreachable on CANCELLED); the
-            // correct shutdown primitive is cancellation, which the Io
-            // backend translates into a clean error.Canceled return from
-            // the pending deviceIoControl.
+            // Unblock run()'s accept loop by self-connecting the listener.
+            // Closing the listener directly panics on Windows (netAccept
+            // asserts unreachable on CANCELLED). Group.cancel is the
+            // "right" primitive but task #5 is where we wire it per
+            // connection — until then, self-connect is the one
+            // cross-platform way to wake an idle accept cleanly.
             //
-            // The listener socket itself is deinitialized by run() after
-            // the loop exits, keeping ownership with the run() frame.
-            self._group.cancel(self.io);
+            // This leaves in-flight serveOne frames alone; they exit
+            // when their clients close. Forced server-initiated teardown
+            // of long-lived connections is also task #5.
+            var addr = net.IpAddress.parse(self.config.address, self.config.port) catch return;
+            var dummy = addr.connect(self.io, .{ .mode = .stream }) catch return;
+            dummy.close(self.io);
         }
 
         fn serveOne(
@@ -366,7 +377,6 @@ pub fn Server(comptime H: type) type {
                 .writer = &io_writer,
             };
 
-            // --- Handshake phase ---
             const hs_state = self._state.handshake_pool.acquire() catch |err| {
                 log.warn("handshake pool exhausted: {}", .{err});
                 return;
@@ -433,16 +443,26 @@ pub fn Server(comptime H: type) type {
 // ---------------------------------------------------------------------------
 
 fn readHandshake(conn: *Conn, io_reader: *std.Io.Reader, state: *Handshake.State) !Handshake {
-    var buf = state.buf;
     while (true) {
-        if (state.len == buf.len) {
+        // Drain whatever the io_reader already buffered; only fetch more
+        // bytes via a single fillMore if it's empty. See the comment in
+        // proto.Reader.fillIo for why readSliceShort is not usable here.
+        var available = io_reader.buffer[io_reader.seek..io_reader.end];
+        if (available.len == 0) {
+            io_reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return error.ConnectionClosed,
+                error.ReadFailed => return error.ConnectionClosed,
+            };
+            available = io_reader.buffer[io_reader.seek..io_reader.end];
+            if (available.len == 0) continue;
+        }
+
+        if (state.len + available.len > state.buf.len) {
             return error.RequestTooLarge;
         }
-        const n = io_reader.readSliceShort(buf[state.len..]) catch |err| switch (err) {
-            error.ReadFailed => return error.ConnectionClosed,
-        };
-        if (n == 0) return error.ConnectionClosed;
-        state.len += n;
+        @memcpy(state.buf[state.len .. state.len + available.len], available);
+        state.len += available.len;
+        io_reader.seek = io_reader.end;
 
         if (Handshake.parse(state) catch |err| {
             log.debug("({f}) handshake parse error: {}", .{ conn.address, err });
@@ -450,7 +470,6 @@ fn readHandshake(conn: *Conn, io_reader: *std.Io.Reader, state: *Handshake.State
         }) |hs| {
             return hs;
         }
-        // else: need more bytes; loop
     }
 }
 
@@ -661,13 +680,6 @@ const SmokeEcho = struct {
 };
 
 test "server_io: handshake + echo" {
-    // TEMPORARILY SKIPPED. The body hangs after the client reads the echo
-    // — likely because Group.cancel on Windows doesn't unblock a pending
-    // AFD accept OR a pending recv without more plumbing. Task #5
-    // (proper per-connection Cancelable + explicit shutdown path) will
-    // fix this. Kept compiling so the code it exercises stays checked.
-    if (true) return error.SkipZigTest;
-
     const gpa = std.testing.allocator;
 
     var threaded = Io.Threaded.init(gpa, .{});
@@ -683,7 +695,6 @@ test "server_io: handshake + echo" {
     try server.bind();
     var run_future = Io.async(io, Server(SmokeEcho).run, .{ &server, {} });
 
-    // Connect as a client.
     var addr = try net.IpAddress.parse("127.0.0.1", 19923);
     var client = try addr.connect(io, .{ .mode = .stream });
     var client_closed = false;
@@ -694,7 +705,6 @@ test "server_io: handshake + echo" {
     var client_reader = client.reader(io, &client_read_buf);
     var client_writer = client.writer(io, &client_write_buf);
 
-    // HTTP upgrade.
     try client_writer.interface.writeAll(
         "GET / HTTP/1.1\r\ncontent-length: 0\r\nupgrade: websocket\r\nsec-websocket-version: 13\r\nconnection: upgrade\r\nsec-websocket-key: my-key\r\n\r\n",
     );
@@ -729,14 +739,10 @@ test "server_io: handshake + echo" {
     try t.expectString("hello", frame_buf[2..7]);
 
     // Close the client first so the server's serveOne read sees EOF and
-    // unwinds through its defers cleanly. Io.Threaded's cancel semantics
-    // on Windows IOCP don't yet interrupt a blocking recv, so we can't
-    // rely on server.stop() + group.cancel() to break the per-conn read
-    // loop — that's scheduled for task #5.
+    // unwinds through its defers. Then stop the listener via self-connect.
     client.close(io);
     client_closed = true;
 
-    // Now shut the listener down.
     server.stop();
     run_future.await(io) catch {};
 }

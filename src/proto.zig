@@ -137,21 +137,35 @@ pub const Reader = struct {
         self.pos = pos + n;
     }
 
-    // Io-native fill. Reads from `io_reader` into the static/large buffer
-    // owned by this Reader. `readSliceShort` drains the Io.Reader's internal
-    // buffer first, then calls its underlying `readVec` to pull more bytes.
-    // A short read (n == 0) means the peer closed the stream.
+    // Io-native fill. Drains io_reader's internal buffer into our
+    // static/large buffer, issuing a single underlying read only if the
+    // io_reader's buffer was already empty.
+    //
+    // Rationale: avoid `readSliceShort(our_buf)` which loops until
+    // `our_buf` is full — on a 2 KiB conn static buffer that blocks on a
+    // second recv that may never come for a single frame. At the same
+    // time, unconditionally calling `fillMore` first would panic on
+    // `std.Io.Reader.fixed` (no underlying stream, rebase returns
+    // EndOfStream) — we still want `fillIo` to work against fixed
+    // readers for proto unit tests.
     pub fn fillIo(self: *Reader, io_reader: *std.Io.Reader) !void {
         const pos = self.pos;
         std.debug.assert(self.buf.data.len > pos);
-        const n = io_reader.readSliceShort(self.buf.data[pos..]) catch |err| switch (err) {
-            // Detailed diagnostic is stashed on the stream's Reader wrapper
-            // (e.g. net.Stream.Reader.err). Callers of fillIo translate this
-            // to a connection-level close, same as the legacy path did.
-            error.ReadFailed => return error.Closed,
-        };
-        if (n == 0) return error.Closed;
-        self.pos = pos + n;
+
+        var available = io_reader.buffer[io_reader.seek..io_reader.end];
+        if (available.len == 0) {
+            io_reader.fillMore() catch |err| switch (err) {
+                error.EndOfStream => return error.Closed,
+                error.ReadFailed => return error.Closed,
+            };
+            available = io_reader.buffer[io_reader.seek..io_reader.end];
+            if (available.len == 0) return; // 0-byte read is not EOF per fillMore docs
+        }
+
+        const want = @min(available.len, self.buf.data.len - pos);
+        @memcpy(self.buf.data[pos .. pos + want], available[0..want]);
+        io_reader.seek += want;
+        self.pos = pos + want;
     }
 
     pub fn read(self: *Reader) !?struct { bool, Message } {

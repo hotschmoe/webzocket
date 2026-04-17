@@ -15,24 +15,47 @@ Conventions:
 
 ## Task #3 — Rewrite server.zig around Io.async (IN PROGRESS)
 
-**Current checkpoint** (`eb49a59` + follow-up): `server_io.zig` compiles,
-existing 33/33 tests still green, one skipped smoke test
-(`server_io: handshake + echo`) captures the intended usage. The skipped
-test hangs on Windows because:
+**Current checkpoint** (follow-up to `a752369`): `server_io.zig` is
+working end-to-end on Windows. 34/34 tests green including the new
+`server_io: handshake + echo` smoke test.
 
-- `net.Server` accept on Windows goes through `netAcceptWindows` →
-  `deviceIoControl(AFD.WAIT_FOR_LISTEN)`. The implementation asserts
-  `CANCELLED => unreachable`, so closing the listener socket mid-accept
-  from `stop()` panics inside the stdlib.
-- The intended shutdown primitive is `Group.cancel`, which translates
-  into `error.Canceled` on the pending `deviceIoControl`. Whether this
-  also unblocks a pending `netRead` for a serveOne frame's read-loop on
-  Windows is not yet verified — probably needs per-conn `Cancelable`
-  token plumbing (task #5).
+Key fixes in this step:
 
-Next step on task #3: get the smoke test (or a shorter variant)
-passing so we can delete the old server.zig. Until then we keep the
-file around but the compiler sees both.
+1. **`readSliceShort` is the wrong primitive for per-frame reads.**
+   It loops until the user buffer is *full*, only returning short on
+   EOF. For a 1024-byte handshake state buf or a 2 KiB conn static
+   buf, that blocks on a second recv that never comes for normal
+   short WebSocket traffic. Replaced with a drain-buffered-then-
+   `fillMore` pattern that does exactly one underlying read per call.
+   Applied to both `proto.Reader.fillIo` and `readHandshake` in
+   server_io. (The old `proto.Reader.fill(stream: anytype)` already
+   did this correctly because a raw `stream.read()` call is one
+   syscall by construction — the regression came from migrating to
+   `std.Io.Reader`.)
+
+2. **Drain before fillMore.** `std.Io.Reader.fixed` has no underlying
+   stream — `fillMore` on it calls `rebase` which returns
+   `EndOfStream`. Unit tests that feed `proto.Reader` via `fixed`
+   would hit that as spurious "Closed". The fix: peek at
+   `io_reader.buffer[seek..end]` first and only call `fillMore` when
+   nothing's buffered.
+
+3. **Server.stop() uses self-connect to unblock accept.** Closing the
+   listener socket mid-AcceptEx panics inside netAcceptWindows
+   (asserts `CANCELLED => unreachable`). Self-connecting to our own
+   listen address is the one cross-platform path that wakes a blocked
+   accept cleanly — the run() loop then checks `_shutdown` after the
+   accept returns and closes the dummy stream. Forced per-connection
+   teardown still pending (task #5).
+
+4. **Server(H).run is non-generic** — ctx's type is extracted from
+   `H.init`'s signature via `CtxType(H)`. `Io.async` / `Group.async`
+   use `std.meta.ArgsTuple`, which rejects `anytype` parameters. The
+   old server dodged this because it wrapped everything through
+   `NonBlocking(H, C)`. The new shape bakes Ctx into Server(H).
+
+Next step on task #3: migrate `testing.zig` and the old server tests
+to the new server, then delete `server.zig` entirely.
 
 **Step 1: map the current server.zig** ✅ — done. Key takeaways:
 - `server.zig` is ~1731 lines. The top-level `Server(H)` is relatively
