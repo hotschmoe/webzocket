@@ -6,6 +6,7 @@ on:
 
 env:
   ZIG_VERSION: "0.16.0"
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   version-check:
