@@ -511,15 +511,34 @@ pub const PipeError = error{
 };
 
 pub fn pipe2(flags: O) PipeError![2]fd_t {
-    if (native_os != .linux) @compileError("pipe2 is linux-only");
     var fds: [2]fd_t = undefined;
-    const rc = system.pipe2(&fds, @bitCast(flags));
-    switch (errno(rc)) {
-        .SUCCESS => return fds,
-        .INVAL => unreachable,
-        .MFILE => return error.ProcessFdQuotaExceeded,
-        .NFILE => return error.SystemFdQuotaExceeded,
-        else => |err| return unexpectedErrno(err),
+    if (comptime native_os == .linux) {
+        const rc = system.pipe2(&fds, @bitCast(flags));
+        switch (errno(rc)) {
+            .SUCCESS => return fds,
+            .INVAL => unreachable,
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => |err| return unexpectedErrno(err),
+        }
+    } else {
+        // macOS/BSD: no pipe2 syscall. Emulate with pipe() + fcntl(F_SETFL).
+        const rc = system.pipe(&fds);
+        switch (errno(rc)) {
+            .SUCCESS => {},
+            .MFILE => return error.ProcessFdQuotaExceeded,
+            .NFILE => return error.SystemFdQuotaExceeded,
+            else => |err| return unexpectedErrno(err),
+        }
+        // Caller always passes .{ .NONBLOCK = true } in webzocket — apply it.
+        if (flags.NONBLOCK) {
+            const o_nonblock: usize = @as(u32, @bitCast(O{ .NONBLOCK = true }));
+            inline for (0..2) |i| {
+                const cur = fcntl(fds[i], F.GETFL, 0) catch 0;
+                _ = fcntl(fds[i], F.SETFL, cur | o_nonblock) catch {};
+            }
+        }
+        return fds;
     }
 }
 
