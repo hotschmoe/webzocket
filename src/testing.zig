@@ -1,76 +1,166 @@
+//! Test helpers for handlers. Users of webzocket write unit tests against
+//! their H type; the `Testing` harness wires a *Conn backed by a real
+//! loopback socket pair so `conn.write(...)` actually sends bytes. The
+//! harness reads the other end of the pair and exposes `expectMessage` /
+//! `expectClose` to assert what the handler wrote.
+//!
+//! Self-standing Io: tests run under test_runner's std.testing.io which
+//! is single-threaded and won't support `Io.async`. The Testing harness
+//! carries its own `std.Io.Threaded` backend so vtable calls to
+//! netListenIp / netConnectIp / netAccept / netRead / netWrite work on
+//! every platform.
+
 const std = @import("std");
 const t = @import("t.zig");
 const ws = @import("websocket.zig");
 
-pub fn init() Testing {
-    return Testing.init();
+const Io = std.Io;
+const net = std.Io.net;
+const Allocator = std.mem.Allocator;
+
+const Conn = ws.Conn;
+const Message = ws.Message;
+
+pub fn init(opts: Opts) *Testing {
+    return Testing.initAlloc(opts) catch |err| std.debug.panic("Testing.init failed: {}", .{err});
 }
 
-pub const Testing = struct {
-    closed: bool,
-    conn: ws.Conn,
-    pair: t.SocketPair,
-    reader: ws.proto.Reader,
-    arena: *std.heap.ArenaAllocator,
+pub const Opts = struct {
+    port: ?u16 = null,
+};
 
-    received: std.ArrayList(ws.Message),
+pub const Testing = struct {
+    // Owned resources (freed in deinit, in reverse order).
+    threaded: *std.Io.Threaded,
+    io: Io,
+    server_stream: net.Stream,
+    client_stream: net.Stream,
+    server_write_buf: []u8,
+    client_read_buf: []u8,
+    reader_buf: []u8,
+    arena: *std.heap.ArenaAllocator,
+    buffer_provider: *ws.buffer.Provider,
+
+    // Stream wrappers. `server_writer` is pointed at by `conn.writer`;
+    // `client_reader` is used internally to drain frames for
+    // expectMessage. Both must be stable in memory because the Io.Reader
+    // / Io.Writer interfaces use @fieldParentPtr on their addresses.
+    server_writer: net.Stream.Writer,
+    client_reader: net.Stream.Reader,
+
+    // Public surface used by tests.
+    conn: Conn,
+    reader: ws.proto.Reader,
+    closed: bool,
+    received: std.ArrayList(Message),
     received_index: usize,
 
-    const Opts = struct {
-        port: ?u16 = null,
-    };
-    fn init(opts: Opts) Testing {
-        const arena = t.allocator.create(std.heap.ArenaAllocator) catch unreachable;
-        errdefer t.allocator.destroy(arena);
+    fn initAlloc(opts: Opts) !*Testing {
+        const gpa = t.allocator;
+        const self = try gpa.create(Testing);
+        errdefer gpa.destroy(self);
+        try self.initInPlace(opts);
+        return self;
+    }
 
-        arena.* = std.heap.ArenaAllocator.init(t.allocator);
+    fn initInPlace(self: *Testing, opts: Opts) !void {
+        const gpa = t.allocator;
+
+        const threaded = try gpa.create(std.Io.Threaded);
+        errdefer gpa.destroy(threaded);
+        threaded.* = std.Io.Threaded.init(gpa, .{});
+        errdefer threaded.deinit();
+        const io = threaded.io();
+
+        const arena = try gpa.create(std.heap.ArenaAllocator);
+        errdefer gpa.destroy(arena);
+        arena.* = std.heap.ArenaAllocator.init(gpa);
         errdefer arena.deinit();
 
-        const port = opts.port orelse 0;
-        const pair = t.SocketPair.init(.{ .port = port });
-        const timeout = std.mem.toBytes(std.posix.timeval{
-            .sec = 0,
-            .usec = 50_000,
+        // Bind an ephemeral loopback port, then connect + accept on the
+        // same thread. On TCP, connect() completes on SYN-ACK from the
+        // kernel (no app-level accept needed) so these can be sequenced.
+        const port: u16 = opts.port orelse 0;
+        var addr = try net.IpAddress.parse("127.0.0.1", port);
+        var listener = try addr.listen(io, .{
+            .reuse_address = true,
+            .mode = .stream,
+            .protocol = .tcp,
         });
-        std.posix.setsockopt(pair.client.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, &timeout) catch unreachable;
+        // After accept succeeds we no longer need the listener; close it
+        // immediately to avoid lingering fd.
+        defer listener.deinit(io);
 
-        const aa = arena.allocator();
-        const buffer_provider = aa.create(ws.buffer.Provider) catch unreachable;
-        buffer_provider.* = ws.buffer.Provider.init(aa, .{
+        var client_stream = try addr.connect(io, .{ .mode = .stream });
+        errdefer client_stream.close(io);
+        var server_stream = try listener.accept(io);
+        errdefer server_stream.close(io);
+
+        const server_write_buf = try gpa.alloc(u8, 4096);
+        errdefer gpa.free(server_write_buf);
+        const client_read_buf = try gpa.alloc(u8, 4096);
+        errdefer gpa.free(client_read_buf);
+        const reader_buf = try gpa.alloc(u8, 4096);
+        errdefer gpa.free(reader_buf);
+
+        const bp = try gpa.create(ws.buffer.Provider);
+        errdefer gpa.destroy(bp);
+        bp.* = try ws.buffer.Provider.init(arena.allocator(), io, .{
             .size = 0,
             .count = 0,
             .max = 20_971_520,
-        }) catch unreachable;
+        });
+        errdefer bp.deinit();
 
-        const reader_buf = aa.alloc(u8, 1024) catch unreachable;
-        const reader = ws.proto.Reader.init(reader_buf, buffer_provider, null);
-
-        return .{
-            .closed = false,
-            .pair = pair,
+        self.* = .{
+            .threaded = threaded,
+            .io = io,
+            .server_stream = server_stream,
+            .client_stream = client_stream,
+            .server_write_buf = server_write_buf,
+            .client_read_buf = client_read_buf,
+            .reader_buf = reader_buf,
             .arena = arena,
+            .buffer_provider = bp,
+            .server_writer = server_stream.writer(io, server_write_buf),
+            .client_reader = client_stream.reader(io, client_read_buf),
             .conn = .{
-                ._closed = false,
+                .io = io,
+                .address = addr,
                 .started = 0,
-                .stream = pair.server,
-                .address = std.net.Address.parseIp("127.0.0.1", port) catch unreachable,
+                .stream = server_stream,
+                // Patched below — we need &self.server_writer to point
+                // at the heap-stable copy, which only exists after this
+                // struct-init assigns it.
+                .writer = undefined,
             },
-            .reader = reader,
-            .received = std.ArrayList(ws.Message).init(aa),
+            .reader = ws.proto.Reader.init(reader_buf, bp, null),
+            .closed = false,
+            .received = .empty,
             .received_index = 0,
         };
+        self.conn.writer = &self.server_writer;
     }
 
     pub fn deinit(self: *Testing) void {
-        self.pair.writer.deinit();
-        close(self.pair.client.handle);
-        close(self.pair.server.handle);
-
+        const gpa = t.allocator;
+        self.received.deinit(gpa);
+        self.reader.deinit();
+        self.buffer_provider.deinit();
+        gpa.destroy(self.buffer_provider);
         self.arena.deinit();
-        t.allocator.destroy(self.arena);
+        gpa.destroy(self.arena);
+        gpa.free(self.reader_buf);
+        gpa.free(self.client_read_buf);
+        gpa.free(self.server_write_buf);
+        self.client_stream.close(self.io);
+        self.server_stream.close(self.io);
+        self.threaded.deinit();
+        gpa.destroy(self.threaded);
+        gpa.destroy(self);
     }
 
-    pub fn expectMessage(self: *Testing, op: ws.Message.Type, data: []const u8) !void {
+    pub fn expectMessage(self: *Testing, op: Message.Type, data: []const u8) !void {
         try self.ensureMessage();
 
         const message = self.received.items[self.received_index];
@@ -85,60 +175,32 @@ pub const Testing = struct {
     }
 
     pub fn expectClose(self: *Testing) !void {
-        if (self.closed) {
-            return;
-        }
+        if (self.closed) return;
 
-        self.fill() catch if (self.closed) {
-            return;
-        };
+        self.fill() catch if (self.closed) return;
 
         return error.NotClosed;
     }
 
-    // we have a 50ms timeout on this socket. It's all localhost. We expect
-    // to be able to read messages in that time.
-    pub fn ensureMessage(self: *Testing) !void {
-        if (self.received_index < self.received.items.len) {
-            return;
-        }
+    fn ensureMessage(self: *Testing) !void {
+        if (self.received_index < self.received.items.len) return;
         return self.fill();
     }
 
     fn fill(self: *Testing) !void {
-        self.reader.fill(self.pair.client) catch |err| switch (err) {
-            error.WouldBlock => return error.NoMoreData,
-            else => {
+        self.reader.fillIo(&self.client_reader.interface) catch |err| switch (err) {
+            error.Closed => {
                 self.closed = true;
                 return err;
             },
         };
 
         while (true) {
-            const more, const message = (try self.reader.read()) orelse return error.NoMoreData;
-            try self.received.append(message);
-            if (more == false) {
-                return;
-            }
+            const result = (try self.reader.read()) orelse return error.NoMoreData;
+            const more = result.@"0";
+            const message = result.@"1";
+            try self.received.append(t.allocator, message);
+            if (!more) return;
         }
     }
 };
-
-// std.posix.close panics on EBADF
-// This is a general issue in Zig:
-// https://github.com/ziglang/zig/issues/6389
-//
-// For these tests, we realy don't know if the server-side of the connection
-// is closed, so we try to close and ignore any errors.
-fn close(fd: std.posix.fd_t) void {
-    const builtin = @import("builtin");
-    const native_os = builtin.os.tag;
-    if (native_os == .windows) {
-        return std.os.windows.CloseHandle(fd);
-    }
-    if (native_os == .wasi and !builtin.link_libc) {
-        _ = std.os.wasi.fd_close(fd);
-        return;
-    }
-    _ = std.posix.system.close(fd);
-}

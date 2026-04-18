@@ -58,11 +58,8 @@ jobs:
       - name: Build
         run: zig build -Doptimize=${{ matrix.optimize }}
 
-      - name: Run Tests (non-blocking)
+      - name: Run Tests
         run: zig build test -Doptimize=${{ matrix.optimize }}
-
-      - name: Run Tests (blocking)
-        run: zig build test -Doptimize=${{ matrix.optimize }} -Dforce_blocking=true
 
   format:
     name: Format Check

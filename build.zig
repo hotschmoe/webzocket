@@ -15,21 +15,11 @@ pub fn build(b: *std.Build) void {
     }
 
     {
-        const options = b.addOptions();
-        options.addOption(bool, "websocket_blocking", false);
-        websocket_module.addOptions("build", options);
-    }
-
-    {
         // run tests
         const tests = b.addTest(.{
             .root_module = websocket_module,
             .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
         });
-        const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
-        const options = b.addOptions();
-        options.addOption(bool, "websocket_blocking", force_blocking);
-        tests.root_module.addOptions("build", options);
 
         const run_test = b.addRunArtifact(tests);
 
