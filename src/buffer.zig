@@ -21,13 +21,13 @@ pub const Writer = struct {
     provider: *Provider,
     interface: std.Io.Writer,
 
-    pub fn init(buf: []u8, pooled: bool, provider: *Provider, dumb: []u8) Writer {
+    pub fn init(buf: []u8, pooled: bool, provider: *Provider) Writer {
         return .{
             .buf = buf,
             .pooled = pooled,
             .provider = provider,
             .interface = .{
-                .buffer = dumb,
+                .buffer = &.{},
                 .vtable = &.{
                     .drain = drain,
                 },
@@ -43,12 +43,21 @@ pub const Writer = struct {
         }
     }
 
-    pub fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) error{WriteFailed}!usize {
-        std.debug.print("drain: {d}\n", .{data[0].len});
-        _ = splat;
+    fn drain(io_w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
         const self: *Writer = @alignCast(@fieldParentPtr("interface", io_w));
-        self.writeAll(data[0]) catch return error.WriteFailed;
-        return data[0].len;
+        self.writeAll(io_w.buffered()) catch return error.WriteFailed;
+        io_w.end = 0;
+
+        var n: usize = 0;
+        for (data[0 .. data.len - 1]) |bytes| {
+            self.writeAll(bytes) catch return error.WriteFailed;
+            n += bytes.len;
+        }
+        const pattern = data[data.len - 1];
+        for (0..splat) |_| {
+            self.writeAll(pattern) catch return error.WriteFailed;
+        }
+        return n + pattern.len * splat;
     }
 
     pub fn writeAll(self: *Writer, data: []const u8) !void {
@@ -83,6 +92,8 @@ pub const Writer = struct {
 
             if (self.pooled) {
                 self.provider.pool.release(buf);
+            } else {
+                allocator.free(buf);
             }
 
             self.buf = new_buffer;
