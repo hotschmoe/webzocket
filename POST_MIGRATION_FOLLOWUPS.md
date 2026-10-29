@@ -19,7 +19,7 @@ deliberately deferred during migration.
   `reader.deinit()` before releasing `reader.static`.
 - **#3** — *Done*. `respondToHandshakeError`'s else branch now surfaces the
   actual `@errorName` instead of "unknown".
-- **#4** — Open. Compression rewrite against 0.16 `Io.Reader`/`Writer`.
+- **#4** — Open. Compression rewrite against 0.16 `Io.Reader`/`Writer`. Receive side done (`Reader.decompress`); send side and re-enabling the config remain.
 - **#5** — Open. TLS client port against 0.16 `std.crypto.tls.Client`.
 - **#6** — *Done*. `thread_pool.zig` imported at top-level from `server.zig`;
   `ThreadPool: small fuzz` / `ThreadPool: large fuzz` now discovered (31+
@@ -200,6 +200,14 @@ around `std.Io.Reader` / `std.Io.Writer`. Both the send path
 need to be rewritten against the new abstractions, and per-connection
 deflate state (the `window bits` / `context_takeover` machinery) needs
 to be re-plumbed.
+
+The receive path is done: `Reader.decompress` gives `flate.Decompress`
+its own `max_window_len` window, restores the stripped `00 00 ff ff`
+sync-flush tail (RFC 7692 7.2.2), and drains into `buffer.Writer`, which
+is now an unbuffered `Io.Writer`. Each message is a fresh stream, which
+is right only because the handshake always answers
+`server_no_context_takeover; client_no_context_takeover`; context
+takeover would need the window kept per connection.
 
 ### 0.16 deflate API reference
 

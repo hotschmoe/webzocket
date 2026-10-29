@@ -402,28 +402,43 @@ pub const Reader = struct {
     }
 
     fn decompress(self: *Reader, compressed: []const u8) ![]u8 {
+        const flate = std.compress.flate;
         const provider = self.large_buffer_provider;
 
-        var dumb: [32]u8 = undefined;
         var writer: buffer.Writer = undefined;
         if (compressed.len < provider.pool_buffer_size) {
             const buf = try provider.pool.acquireOrCreate();
-            writer = .init(buf, true, provider, &dumb);
+            writer = .init(buf, true, provider);
         } else {
             const buf = try provider.allocator.alloc(u8, @intFromFloat(@as(f64, @floatFromInt(compressed.len)) * 1.25));
-            writer = .init(buf, false, provider, &dumb);
+            writer = .init(buf, false, provider);
         }
-
         errdefer writer.deinit();
 
-        var reader = std.Io.Reader.fixed(compressed);
-        var decompressor = std.compress.flate.Decompress.init(&reader, .raw, &.{});
-        const n = decompressor.reader.streamRemaining(&writer.interface) catch {
-            return error.CompressionError;
+        // RFC 7692 7.2.2: the sender strips the 0x00 0x00 0xff 0xff that ends its sync flush; put it back.
+        const tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
+        const scratch = try provider.allocator.alloc(u8, flate.max_window_len + compressed.len + tail.len);
+        defer provider.allocator.free(scratch);
+        const window = scratch[0..flate.max_window_len];
+        const input = scratch[flate.max_window_len..];
+        @memcpy(input[0..compressed.len], compressed);
+        @memcpy(input[compressed.len..], &tail);
+
+        // Contexts are never taken over (the handshake always answers no_context_takeover), so every
+        // message is a fresh stream. One that ends in a sync flush instead of a final block runs out of
+        // input after its last byte has been decoded.
+        var reader: std.Io.Reader = .fixed(input);
+        var decompressor: flate.Decompress = .init(&reader, .raw, window);
+        _ = decompressor.reader.streamRemaining(&writer.interface) catch |err| switch (err) {
+            error.ReadFailed => {
+                if (decompressor.err.? != error.EndOfStream or reader.bufferedLen() != 0) return error.CompressionError;
+                writer.interface.writeAll(decompressor.reader.buffered()) catch return error.CompressionError;
+            },
+            error.WriteFailed => return error.CompressionError,
         };
 
         self.decompress_writer = writer;
-        return writer.buf[0..n];
+        return writer.buf[0..writer.pos];
     }
 
     inline fn usingLargeBuffer(self: *const Reader) bool {
@@ -772,6 +787,77 @@ test "Reader: fuzz" {
     }
 }
 
+test "Reader: compressed message ending in a sync flush" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+
+    // a non-final stored block, then the header of the sync flush's empty stored block, whose
+    // 0x00 0x00 0xff 0xff lengths were stripped
+    const msg = "over 9000!";
+    const payload = [_]u8{ 0x00, msg.len, 0x00, ~@as(u8, msg.len), 0xff } ++ msg.* ++ [_]u8{0x00};
+    pair.writer.frame(true, 1, &payload, 64);
+    pair.sendBuf();
+
+    var reader = testReader(.{ .max = 1024, .compression = Compression{} });
+    defer reader.deinit();
+    const message = try testRead(&reader, pair);
+    defer reader.done(message.type);
+    try t.expectString(msg, message.data);
+}
+
+test "Reader: compressed messages" {
+    defer t.reset();
+
+    var pair = t.SocketPair.init(.{});
+    defer pair.deinit();
+
+    var reader = testReader(.{ .max = 100_000, .static = 1024, .size = 256, .count = 1, .compression = Compression{} });
+    defer reader.large_buffer_provider.deinit();
+    defer reader.deinit();
+
+    // past the 32K window, so back references reach into data that was already handed to the writer
+    const large = try t.arena.allocator().alloc(u8, 70_000);
+    for (large, 0..) |*b, i| b.* = @intCast((i * 7 + i / 1000) % 251);
+
+    for ([_][]const u8{ "hello world", large }) |msg| {
+        const payload = try deflate(msg);
+        pair.writer.frame(true, 2, payload, 64);
+        pair.sendBuf();
+
+        const message = try testRead(&reader, pair);
+        defer reader.done(message.type);
+        try t.expectString(msg, message.data);
+    }
+
+    {
+        const msg = "a message in two fragments, compressed as one";
+        const payload = try deflate(msg);
+        pair.writer.frame(false, 1, payload[0..5], 64);
+        pair.writer.cont(true, payload[5..]);
+        pair.sendBuf();
+
+        const message = try testRead(&reader, pair);
+        defer reader.done(message.type);
+        try t.expectString(msg, message.data);
+    }
+
+    pair.writer.frame(true, 1, &.{ 0xff, 0xff, 0xff }, 64);
+    pair.sendBuf();
+    try t.expectError(error.CompressionError, testRead(&reader, pair));
+}
+
+fn deflate(msg: []const u8) ![]u8 {
+    const flate = std.compress.flate;
+    var out: std.Io.Writer.Allocating = try .initCapacity(t.arena.allocator(), 64);
+    var window: [flate.max_window_len]u8 = undefined;
+    var compressor = try flate.Compress.init(&out.writer, &window, .raw, .default);
+    try compressor.writer.writeAll(msg);
+    try compressor.finish();
+    return out.written();
+}
+
 test "Fragmented" {
     {
         var bp = try buffer.Provider.init(t.allocator, std.testing.io, .{ .count = 0, .size = 0, .max = 500 });
@@ -844,7 +930,7 @@ fn testReader(opts: anytype) Reader {
 
     const static_size = if (@hasField(T, "static")) opts.static else 16;
     const reader_buf = aa.alloc(u8, static_size) catch unreachable;
-    return Reader.init(reader_buf, bp, null);
+    return Reader.init(reader_buf, bp, if (@hasField(T, "compression")) opts.compression else null);
 }
 
 fn testRead(reader: *Reader, pair: t.SocketPair) !Message {
