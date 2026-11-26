@@ -1,0 +1,16 @@
+name: Background protocol campaign
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "19 4 * * *"
+
+jobs:
+  protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: "0.17.1"
+      - run: zig build test-heavy

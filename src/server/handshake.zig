@@ -105,9 +105,10 @@ pub const Handshake = struct {
             return error.MissingHeaders;
         }
 
-        // we already established that request_line ends with http/1.1, so this buys
-        // us some leeway into parsing it
         const separator = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.InvalidRequestLine;
+        if (request_line.len < 9 or separator >= request_line.len - 9) {
+            return error.InvalidRequestLine;
+        }
         const method = request_line[0..separator];
         const url = std.mem.trim(u8, request_line[separator + 1 .. request_line.len - 9], &ascii.whitespace);
 

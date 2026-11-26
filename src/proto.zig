@@ -173,23 +173,15 @@ pub const Reader = struct {
 
                 // At this point, we're sure that we have at least enough bytes to know
                 // the total length of the message.
-                var ml = switch (length_of_len) {
+                const payload_len = switch (length_of_len) {
                     2 => @as(u16, @intCast(buf[3])) | @as(u16, @intCast(buf[2])) << 8,
                     8 => @as(u64, @intCast(buf[9])) | @as(u64, @intCast(buf[8])) << 8 | @as(u64, @intCast(buf[7])) << 16 | @as(u64, @intCast(buf[6])) << 24 | @as(u64, @intCast(buf[5])) << 32 | @as(u64, @intCast(buf[4])) << 40 | @as(u64, @intCast(buf[3])) << 48 | @as(u64, @intCast(buf[2])) << 56,
                     else => buf[1] & 127,
-                } + length_of_len + 2; // + 2 for the 2 byte prefix
-
-                masked = byte2 & 128 == 128;
-                if (masked) {
-                    // message is masked
-                    ml += 4;
-                }
-
-                if (comptime builtin.target.ptrBitWidth() < 64) {
-                    if (ml > std.math.maxInt(usize)) {
-                        return error.TooLarge;
-                    }
-                }
+                };
+                const header_len = length_of_len + 2 + @as(usize, if (masked) 4 else 0);
+                if (payload_len > std.math.maxInt(u63) or
+                    payload_len > std.math.maxInt(usize) - header_len) return error.TooLarge;
+                const ml = @as(usize, @intCast(payload_len)) + header_len;
 
                 message_len = @intCast(ml);
                 self.message_len = message_len;

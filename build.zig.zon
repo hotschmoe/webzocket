@@ -2,7 +2,7 @@
     .name = .webzocket,
     .version = "0.3.0",
     .fingerprint = 0x65c1d1711bac4ea9, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.17.0",
+    .minimum_zig_version = "0.17.1",
     .dependencies = .{},
     .paths = .{
         "build.zig",
