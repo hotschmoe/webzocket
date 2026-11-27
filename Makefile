@@ -13,6 +13,10 @@ tn:
 tb:
 	TEST_FILTER='${F}' '${zig}' build test -Dforce_blocking=true -freference-trace --summary all
 
+.PHONY: th
+th:
+	'${zig}' build test-heavy --summary all
+
 .PHONY: abs
 abs:
 	bash support/autobahn/server/run.sh

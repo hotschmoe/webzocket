@@ -4,15 +4,27 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Repository Overview
 
-`webzocket` is a Zig WebSocket library (server + client), exposed as a single module named `webzocket` (root: `src/websocket.zig`). It is a fork of `karlseguin/websocket.zig` renamed for use as a Zig package dependency. Zig version: **0.17.0** (see `build.zig.zon`, `minimum_zig_version`). No external dependencies.
+`webzocket` is a Zig WebSocket library (server + client), exposed as module `webzocket`
+(root: `src/websocket.zig`). It is the owner's fork of `karlseguin/websocket.zig`.
+Zig version: **0.17.1**. No external dependencies. Follow `docs/TIGERSTYLE.md` and
+[ENGINEERING.md](https://github.com/hotschmoe/hotschmoe-setup/blob/master/ENGINEERING.md); reasons belong in `SRC.md`.
 
 ## Common Commands
 
 Build / test use the Makefile or raw `zig build`:
 
+- `zig build tidy` — blocking style ratchets; `-- --table` reports counts,
+  `-- --update` records decreases and rejects increases.
+- `zig build test` — tidy, fixed-seed protocol fuzzing, then the existing test runner.
+- `zig build fuzz -- --seed 1 --iterations 4096` — protocol byte oracle, no sockets.
+- `zig build fuzz -- --replay zig-out/fuzz/seed-1-case-2.bin` — replay saved input and metadata.
+- Length overflow and short request lines are ordinary generated profiles.
+- `zig build fuzz -- --probe forbidden-fragment` — expose the reader's fragment allocation.
+- `zig build fuzz-heavy` or `zig build test-heavy` — 30-second background budget.
 - `make tn` — run tests in non-blocking (kqueue/epoll) mode.
 - `make tb` — run tests in blocking (one-thread-per-conn) mode.
 - `make t` — run both modes.
+- `make th` — run the background protocol budget.
 - `make F=<name> tn` — filter tests by substring (Makefile forwards `TEST_FILTER` env var consumed by `test_runner.zig`).
 - `zig build test -Dforce_blocking=true|false -Doptimize=Debug|ReleaseSafe|ReleaseFast|ReleaseSmall` — direct invocation.
 - `zig fmt --check src/` — formatter check (CI enforces this; run `zig fmt src/` to fix).
