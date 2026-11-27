@@ -30,7 +30,8 @@ must meet every style target independently of its stored numbers. It must
 exist, be in scope and not be skipped or generated. Duplicate and noncanonical
 paths fail. Updates preserve the entire list, including when a file is missing;
 they never remove entries. Webzocket holds every new Zig source file: the owned assert,
-the five fuzzer modules and `tools/tidy.zig`. The list is authoritative in the ratchet.
+the five fuzzer modules, `tools/tidy.zig`, the four `conn*.zig` files and the eight `sim*.zig` files.
+The list is authoritative in the ratchet.
 Seam inventories and globals may be nonzero; style targets are zero, with
 longest function at most 70. Moving a held file
 out of a group also moves its assertion demand and surplus credit.
@@ -311,9 +312,155 @@ Known difference for the rewrite: Host is optional.
 Known difference for the rewrite: malformed CRLF separators can be accepted.
 Known difference for the rewrite: truncation has no typed EOF result without an end-of-input signal.
 
+## src/conn.zig, conn_frame.zig, conn_handshake.zig, conn_utf8.zig
+
+One endpoint of a WebSocket connection as a state machine over bytes: server or client role, no socket, no
+thread, no allocator after init, no clock. It is the first rewritten module (D1) and is exported as
+`webzocket.conn` (`conn.Conn`, `conn.Config`, `conn.Event`, `conn.Error`, `conn.SendError`, `conn.Eof`,
+`conn.Stats`). The server's own type already owns the name `webzocket.Conn`, so the new one lives in a
+namespace until the old server goes; then it takes the short name. The old server, client and reader are
+untouched.
+
+API shape: a poll loop, not events returned from `feed`.
+
+- Input: `recv_space()` and `received(n)` let a caller read a socket straight into the receive buffer;
+  `feed(bytes)` is the same with one copy. It accepts at most the free space and returns the count, so the
+  caller offers the rest again after polling.
+- `poll()` returns one `Event` (`opened`, `message`, `ping`, `pong`, `closed`) or null when it needs
+  input, or a typed `Error`. Event slices (message data, ping payload, close reason, request target) are
+  valid until the next `poll`, `feed` or `recv_space`.
+- Output: `output()` is the queued bytes, `output_taken(n)` frees them. `start_client`, `send_message`,
+  `send_fragment`, `send_ping` and `send_close` queue frames; `end_of_input()` is the outcome of a
+  transport end in the current state; `tick(now_ms)` checks the two deadlines.
+
+Why poll: a returned event slice has to live somewhere. With events returned from `feed` one call can complete
+many messages, so either every message needs its own storage or the caller gets a list of slices that the
+next frame overwrites. With a poll loop one message buffer is enough, the caller decides when to drain, back
+pressure is the free space of the receive buffer, and a frame header or payload is consumed as it arrives, so
+the receive buffer only has to hold a header (and the whole HTTP head during the handshake). Turned down:
+events returned from `feed` (above), and a callback interface (puts the caller's code inside the state
+machine and hides the order of effects). The zunk reload connection reads one 256-byte buffer by hand
+(`buf`, `pos`, `message_len`) and sets the provider maximum to 0 so that nothing can allocate. With `Conn`
+that loop is: `feed` or `received` after a read, `poll` until null, write `output()` and call
+`output_taken`; the handshake, ping, close and masking rules are the library's, and nothing can allocate.
+
+Storage and limits (D7): the caller passes three slices at init. The receive buffer must hold the HTTP head
+(request or reply) and at least 64 bytes; a head that does not fit is `HandshakeTooLarge`. The message
+buffer is the largest assembled message; a frame or the running total of fragments above it is
+`MessageTooLarge` and is detected from the header, before the payload is read. The send queue holds whole
+frames; a frame bigger than the queue is `TooLarge`, one that does not fit now is `QueueFull`; both are
+returned, counted in `Stats.sends_refused` and never partially written. `Stats` also records the high
+water of each buffer, so a check can compare use against what was declared. An automatic reply that does
+not fit waits: the newest ping's pong is kept (an earlier unsent pong is replaced and counted in
+`pongs_coalesced`, which RFC 6455 section 5.5.3 allows) and a close echo is kept; they are written as soon
+as `output_taken` frees room, and new sends are refused while one waits so the order on the wire holds.
+
+Checks in a frame header run in this order: reserved bits, opcode, control frame rules (not fragmented,
+payload at most 125), mask by role (a server rejects an unmasked frame, a client a masked one), length form
+(no sign bit, minimal), then the state rules (a continuation needs a message in progress, a new data frame
+needs none), then the size limit. The receiver unmasks while it copies into the message buffer and checks
+UTF-8 incrementally, so a code point may be split across fragments and an invalid byte is rejected where it
+arrives. Close frames: one byte is a protocol error, the code must be 1000 to 1003, 1007 to 1014 or 3000 to
+4999, and the reason must be UTF-8. Close codes sent after an error: 1002, 1007 (invalid UTF-8) or 1009
+(too large). A server that rejects a handshake queues a short `400` reply; a client that rejects a reply
+sends nothing.
+
+Closing: `send_close` moves to `closing`; the peer's data and pings are still delivered until its close
+arrives. A peer close is answered with its code (no reason) unless this side already sent one. After this
+side has queued a close it answers no more pings. After a close or an error nothing is delivered and
+nothing is produced; bytes still fed are counted in `ignored_bytes`.
+
+End of input is `clean` (closing handshake complete), `failed`, `in_handshake`, `in_frame`, `in_message`,
+`without_close` or `during_close`. Time is a parameter: `init` and `send_close` take `now_ms`; with
+`handshake_timeout_ms` or `close_timeout_ms` set, `tick` fails the connection with `Timeout`. Client mask
+keys come from a ChaCha generator seeded by `Config.mask_seed`; the caller supplies the 16 key bytes of the
+opening handshake to `start_client`. Nothing inside reads an entropy source. A client with an all-zero
+seed is `InvalidConfig`: mask keys must not be predictable, so the seed has no usable default.
+
+permessage-deflate is out of scope for this step: a server ignores an extension offer and replies without
+one, a client offers none and fails a reply that names an extension (`ExtensionNotOffered`), and any
+reserved bit is `ReservedBits`. Also not done: custom reply headers, subprotocol negotiation (a server
+ignores offers, a client fails a reply that names one), Origin checks, a `426` reply for a wrong version,
+keepalive timers, and splitting a long message into frames (the caller chooses fragments).
+
+Closed in `Conn` (the old code keeps them):
+
+- proto.zig: a maximum below the static buffer has no effect (closed: the message buffer is the limit);
+  non-minimal lengths (`NonMinimalLength`); text UTF-8 (`InvalidUtf8`, also across fragments); close payload
+  length, code and reason (`BadClosePayload`, `BadCloseCode`, `InvalidUtf8`); truncation without a typed
+  outcome (`end_of_input`); fragment storage that asks an allocator even when it would fit (no allocator);
+  `writeFrameHeader` emitting oversized control headers (`send_ping` refuses more than 125 bytes with
+  `TooLarge`; the old function stays as it is until the old reader goes).
+- handshake.zig: keys not checked as base64 of 16 bytes (`BadKey`); `Connection` matched as a substring (it is a
+  token list now); methods other than GET (`BadMethod`); optional `Host` (`MissingHost`); malformed CRLF
+  separators, bare CR or LF, control bytes and folded lines (`BadLineEnding`, `BadByte`, `BadHeader`);
+  truncation (`end_of_input`). Duplicate `Host`, `Sec-WebSocket-Key`, `Sec-WebSocket-Version` and
+  `Sec-WebSocket-Accept` headers are `DuplicateHeader`.
+
+Still open, and why: the `Upgrade` header is accepted as a token list that contains `websocket` (RFC 6455
+asks for a header containing the value; the old parser wants exactly one), so a request the old parser
+rejects (generator class 93) opens in `Conn`; this is deliberate and counted as `conn_looser`. Subprotocol
+and extension negotiation, custom reply headers and compression are listed above. The request target is
+checked for printable ASCII only. Header count and size are bounded by the receive buffer, not by a separate
+limit.
+
+## src/sim.zig and src/sim_*.zig
+
+`zig build sim -- --seed N --steps M [--seeds K] [--seconds S] [--replay file]` is the simulator for `Conn`.
+The executable owns IO, the clock (only for `--seconds`) and one startup allocation of its workspace; every
+other file is deterministic and has no global state. A seed names a run; each run is made of sessions, and a
+session is seeded by the seed and its index, so `--replay` of a failure file re-runs exactly that session
+(honest or adversary) or the corpus pass. The run of a seed is executed twice, in memory filled with
+different bytes, and the two trace hashes must match (this also catches reads of uninitialized memory). A
+failure prints the seed, session, checker and detail and writes `zig-out/sim/seed-N-session-I.txt`, which
+is a recording of the seed and session, not golden output.
+
+- sim_world.zig, an honest session: client and server `Conn` joined by two pipes (sim_pipe.zig) that deliver
+  in chunks from one byte up, delay segments, and can be cut at any delivered byte or stalled. Storage sizes
+  are chosen low on purpose, so refused sends and limits are ordinary. A seeded workload sends texts and
+  binaries (fragmented, with pings between fragments), pings and closes, from both sides, with both sides
+  closing at once in a quarter of the closes. Checkers: every message arrives once, in order, byte-identical;
+  every ping is answered by a pong with its payload (an unanswered ping is allowed only for coalesced pongs and
+  for pings that reach a side that already sent its close); both sides end closed with the code and reason
+  of the other side's close (or the echo); after a close or error nothing is delivered and no byte is
+  produced; a refused send happens only when the queue could not hold the frame and is counted exactly; the
+  outcome at a cut or stall is the typed end of input that an independent frame scanner (sim_wire.zig)
+  computes from the delivered bytes; every buffer has canary bytes around it and the high water marks stay
+  within what was declared; each stream a `Conn` emits is fed, as it is emitted, to the old
+  `proto.Reader` (random static buffer sizes, a bounded fixed-buffer allocator), and what the Reader
+  returns must equal what the receiving `Conn` delivers, including pongs and closes. The client request is
+  also parsed by the old `Handshake.parse`.
+- sim_adversary.zig: one side replaced by a generator of damaged byte streams. 56 classes: reserved bits,
+  reserved opcodes, fragmented and oversized control frames, wrong mask for the role, both non-minimal
+  length forms, the sign bit, stray continuations, data frames inside a fragmented message, frames and
+  fragment sums over the limit, bad UTF-8 (single, split, truncated), bad close payloads, 23 damaged requests
+  and 13 damaged replies, valid handshake variants (case, token lists, extension and subprotocol offers),
+  valid closes followed by garbage, and valid streams cut at a random byte. Each class has one expected error,
+  one expected close code and one expected output (the 400 text, nothing, or valid pongs then one close
+  frame). The same stream also runs with whole-buffer feeding, and the two runs must agree on events, error,
+  output and end of input.
+- sim_corpus.zig: the existing tester's generator (fuzz_generate.zig) fed to `Conn` in both roles, 200 cases
+  per seed. A stream the old Reader accepts must be accepted by `Conn` in at least one role with the same
+  messages, or be rejected with one of the errors that class is known to differ by (listed in the code and
+  counted per class in the output as `conn_stricter`: mask by role, non-minimal lengths, UTF-8, close payloads,
+  RSV1, weak or duplicate handshake keys and headers, wrong method, missing Host, malformed CRLF). A stream the
+  old code rejects must be rejected by `Conn` with the matching error in at least one role; the only
+  accepted exception is class 93 (above).
+- Gates: `zig build test` runs a fixed-seed run (seeds 1 and 2, 3000 steps) after tidy and the short fuzzer;
+  `zig build test-heavy` also runs `sim-heavy`, a 30 second campaign of 200,000-step seeds.
+
+Of the 38 existing test declarations, the simulator makes redundant "Reader: fuzz" and "mask" (the old Reader
+reads generated masked and unmasked frames of every length class with random buffer sizes, and the unmasking
+is checked against an independent encoder), and the fragment-accumulation block of "Fragmented". They are
+kept in this step. The others test code the simulator does not reach (servers, sockets, pools, compression,
+the buffer provider).
+
 ## build.zig
 
-Only the root package registers tidy, fuzz and existing test steps. Consumers configure the
+`src/assert.zig` is a named module (`assert`) that the library, the fuzzer and the simulator import by name,
+because a file may belong to one module only and `conn.zig` has to use the owned assert. A consumer gets it as
+an import of the `webzocket` module; no extra step or option appears. Only the root package registers tidy,
+fuzz, sim and existing test steps. Consumers configure the
 public module and its options; packaging includes only the build files, src and LICENSE.
 The assert and fuzz sources under src are not imported by websocket.zig and do not enter a
 consumer's runtime module graph. The build file itself uses the owned assert from src.

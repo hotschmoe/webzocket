@@ -1,7 +1,7 @@
 const std = @import("std");
 const generate = @import("fuzz_generate.zig");
 const checker = @import("fuzz_check.zig");
-const assert = @import("assert.zig").assert;
+const assert = @import("assert").assert;
 
 const iterations_max: u32 = 10000000;
 const Options = struct {

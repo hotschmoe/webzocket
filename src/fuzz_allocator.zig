@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = @import("assert.zig").assert;
+const assert = @import("assert").assert;
 
 pub const Tracking = struct {
     backing: std.mem.Allocator,

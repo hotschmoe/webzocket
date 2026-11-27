@@ -15,8 +15,9 @@ Build / test use the Makefile or raw `zig build`:
 
 - `zig build tidy` — blocking style ratchets; `-- --table` reports counts,
   `-- --update` records decreases and rejects increases.
-- `zig build test` — tidy, fixed-seed protocol fuzzing, then the existing test runner.
+- `zig build test` — tidy, fixed-seed protocol fuzzing, the fixed-seed connection simulator, then the existing test runner.
 - `zig build fuzz -- --seed 1 --iterations 4096` — protocol byte oracle, no sockets.
+- `zig build sim -- --seed 1 --steps 20000 --seeds 4` — simulator for `webzocket.conn.Conn` (two endpoints, seeded pipe, adversary streams, cross-check against the old reader); `-- --replay zig-out/sim/seed-N-session-I.txt` re-runs a failure; `zig build sim-heavy` is the 30-second budget.
 - `zig build fuzz -- --replay zig-out/fuzz/seed-1-case-2.bin` — replay saved input and metadata.
 - Length overflow and short request lines are ordinary generated profiles.
 - `zig build fuzz -- --probe forbidden-fragment` — expose the reader's fragment allocation.
@@ -39,6 +40,7 @@ Public surface is re-exported from `src/websocket.zig`. Reading that file first 
 ### Module layout
 - `src/websocket.zig` — root module, public re-exports, `Compression` config type, `frameText`/`frameBin` comptime helpers.
 - `src/proto.zig` — WebSocket wire protocol: `OpCode`, `Message`, the `Reader` state machine that parses frames out of a possibly-overread buffer, frame construction.
+- `src/conn.zig`, `conn_frame.zig`, `conn_handshake.zig`, `conn_utf8.zig` — `webzocket.conn`: one WebSocket endpoint as a state machine over bytes (no socket, thread, allocator or clock), rewritten under TigerStyle; see SRC.md. Simulator: `src/sim*.zig`.
 - `src/buffer.zig` — `buffer.Provider`: pooled small/large buffers with dynamic fallback, shared across connections.
 - `src/server/server.zig` — `Server(H)`, `Conn`, `Config`. Contains both non-blocking (kqueue/epoll) and blocking implementations, selected at comptime via `blockingMode()`.
 - `src/server/handshake.zig` — HTTP upgrade parsing and response.

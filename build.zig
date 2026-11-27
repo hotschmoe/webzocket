@@ -19,9 +19,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/websocket.zig"),
         .link_libc = true,
     });
-    if (target.result.os.tag == .windows) {
-        websocket_module.linkSystemLibrary("ws2_32", .{});
-    }
+    const assert_module = b.createModule(.{ .root_source_file = b.path("src/assert.zig") });
+    websocket_module.addImport("assert", assert_module);
+    if (target.result.os.tag == .windows) websocket_module.linkSystemLibrary("ws2_32", .{});
 
     {
         const options = b.addOptions();
@@ -36,13 +36,19 @@ pub fn build(b: *std.Build) void {
         websocket_module.addOptions("build_options", options);
     }
 
-    if (b.pkg_hash.len == 0) add_checks(b, websocket_module);
+    if (b.pkg_hash.len == 0) add_checks(b, websocket_module, assert_module);
 }
 
-fn add_checks(b: *std.Build, websocket_module: *std.Build.Module) void {
+fn add_checks(
+    b: *std.Build,
+    websocket_module: *std.Build.Module,
+    assert_module: *std.Build.Module,
+) void {
     const tidy = add_tidy(b);
-    const fuzz_short = add_fuzz(b, websocket_module);
+    const fuzz_short = add_fuzz(b, websocket_module, assert_module);
     fuzz_short.step.dependOn(&tidy.step);
+    const sim_short = add_sim(b, websocket_module, assert_module);
+    sim_short.step.dependOn(&tidy.step);
     {
         const tests = b.addTest(.{
             .root_module = websocket_module,
@@ -55,6 +61,7 @@ fn add_checks(b: *std.Build, websocket_module: *std.Build.Module) void {
 
         const run_test = b.addRunArtifact(tests);
         run_test.step.dependOn(&fuzz_short.step);
+        run_test.step.dependOn(&sim_short.step);
 
         const test_step = b.step("test", "Tidy, short seeded protocol run, existing tests");
         test_step.dependOn(&run_test.step);
@@ -77,7 +84,11 @@ fn add_tidy(b: *std.Build) *std.Build.Step.Run {
     return run;
 }
 
-fn add_fuzz(b: *std.Build, websocket_module: *std.Build.Module) *std.Build.Step.Run {
+fn add_fuzz(
+    b: *std.Build,
+    websocket_module: *std.Build.Module,
+    assert_module: *std.Build.Module,
+) *std.Build.Step.Run {
     assert(websocket_module.root_source_file != null);
     const module = b.createModule(.{
         .root_source_file = b.path("src/fuzz.zig"),
@@ -85,6 +96,7 @@ fn add_fuzz(b: *std.Build, websocket_module: *std.Build.Module) *std.Build.Step.
         .optimize = .ReleaseSafe,
     });
     module.addImport("webzocket", websocket_module);
+    module.addImport("assert", assert_module);
     const executable = b.addExecutable(.{ .name = "fuzz", .root_module = module });
     const run = b.addRunArtifact(executable);
     run.addPassthruArgs();
@@ -95,5 +107,32 @@ fn add_fuzz(b: *std.Build, websocket_module: *std.Build.Module) *std.Build.Step.
     heavy.addArgs(&.{ "--seed", "72831", "--seconds", "30" });
     b.step("fuzz-heavy", "Background protocol budget").dependOn(&heavy.step);
     b.step("test-heavy", "Non-blocking background gate").dependOn(&heavy.step);
+    return short;
+}
+
+fn add_sim(
+    b: *std.Build,
+    websocket_module: *std.Build.Module,
+    assert_module: *std.Build.Module,
+) *std.Build.Step.Run {
+    assert(websocket_module.root_source_file != null);
+    assert(assert_module.root_source_file != null);
+    const module = b.createModule(.{
+        .root_source_file = b.path("src/sim.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    module.addImport("webzocket", websocket_module);
+    module.addImport("assert", assert_module);
+    const executable = b.addExecutable(.{ .name = "sim", .root_module = module });
+    const run = b.addRunArtifact(executable);
+    run.addPassthruArgs();
+    b.step("sim", "Seeded connection simulator").dependOn(&run.step);
+    const short = b.addRunArtifact(executable);
+    short.addArgs(&.{ "--seed", "1", "--steps", "3000", "--seeds", "2" });
+    const heavy = b.addRunArtifact(executable);
+    heavy.addArgs(&.{ "--seed", "90210", "--steps", "200000", "--seconds", "30" });
+    b.step("sim-heavy", "Background simulator budget").dependOn(&heavy.step);
+    if (b.top_level_steps.get("test-heavy")) |top| top.step.dependOn(&heavy.step);
     return short;
 }

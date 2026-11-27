@@ -7,6 +7,7 @@ pub const version: []const u8 = @import("build_options").version;
 pub const buffer = @import("buffer.zig");
 
 pub const proto = @import("proto.zig");
+pub const conn = @import("conn.zig");
 pub const OpCode = proto.OpCode;
 pub const Message = proto.Message;
 pub const MessageType = Message.Type;

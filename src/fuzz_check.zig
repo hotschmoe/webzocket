@@ -1,7 +1,7 @@
 const std = @import("std");
 const ws = @import("webzocket");
 const generate = @import("fuzz_generate.zig");
-const assert = @import("assert.zig").assert;
+const assert = @import("assert").assert;
 const Tracking = @import("fuzz_allocator.zig").Tracking;
 
 pub const memory_max: u32 = 2 * 1024 * 1024;
