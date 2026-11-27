@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = @import("assert.zig").assert;
+const assert = @import("assert").assert;
 
 pub const input_max: u32 = 150000;
 pub const payload_max: u32 = 140000;

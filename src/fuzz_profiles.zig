@@ -1,6 +1,6 @@
 const std = @import("std");
 const g = @import("fuzz_generate.zig");
-const assert = @import("assert.zig").assert;
+const assert = @import("assert").assert;
 
 pub fn generate_extra(case: *g.Case, random: std.Random) !void {
     assert(case.class >= 64 and case.class < g.classes);

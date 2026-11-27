@@ -1,6 +1,18 @@
 .{
     .held_files = .{
         "src/assert.zig",
+        "src/conn.zig",
+        "src/conn_frame.zig",
+        "src/conn_handshake.zig",
+        "src/conn_utf8.zig",
+        "src/sim.zig",
+        "src/sim_adversary.zig",
+        "src/sim_corpus.zig",
+        "src/sim_core.zig",
+        "src/sim_cross.zig",
+        "src/sim_pipe.zig",
+        "src/sim_wire.zig",
+        "src/sim_world.zig",
         "src/fuzz.zig",
         "src/fuzz_generate.zig",
         "src/fuzz_check.zig",
@@ -70,6 +82,38 @@
             },
         },
         .{
+            .name = "src/conn.zig",
+            .counts = .{
+                0, 0, 48, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/conn_frame.zig",
+            .counts = .{
+                0, 0, 40, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/conn_handshake.zig",
+            .counts = .{
+                0, 0, 22, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/conn_utf8.zig",
+            .counts = .{
+                0, 0, 27, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
             .name = "src/fuzz.zig",
             .counts = .{
                 0, 0, 28, 0, 0, 0,
@@ -115,6 +159,70 @@
                 77, 4,  169, 185, 26, 1,
                 0,  8,  55,  28,  8,  0,
                 12, 19, 0,   4,   0,  0,
+            },
+        },
+        .{
+            .name = "src/sim.zig",
+            .counts = .{
+                0, 0, 30, 0, 0, 0,
+                0, 0, 0,  1, 5, 0,
+                0, 5, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_adversary.zig",
+            .counts = .{
+                0, 0, 55, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_core.zig",
+            .counts = .{
+                0, 0, 14, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_corpus.zig",
+            .counts = .{
+                0, 0, 27, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_cross.zig",
+            .counts = .{
+                0, 0, 18, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_pipe.zig",
+            .counts = .{
+                0, 0, 20, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_wire.zig",
+            .counts = .{
+                0, 0, 33, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+            },
+        },
+        .{
+            .name = "src/sim_world.zig",
+            .counts = .{
+                0, 0, 36, 0, 0, 0,
+                0, 0, 0,  0, 0, 0,
+                0, 0, 0,  0, 0, 0,
             },
         },
         .{
